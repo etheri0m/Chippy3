@@ -17,10 +17,7 @@ def radar_worker(port, state_key):
     client = a121.Client.open(serial_port=port)
 
     # Setup Presence Detector (No update_rate parameter here)
-    config = DetectorConfig(
-        start_m=0.1,
-        end_m=2.0
-    )
+    config = DetectorConfig(frame_rate=20.0)
 
     detector = Detector(client=client, sensor_id=1, detector_config=config)
     detector.start()

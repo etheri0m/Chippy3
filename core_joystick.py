@@ -6,81 +6,119 @@ from acconeer.exptool.a121.algo.presence import Detector, DetectorConfig
 
 JOYSTICK_RADAR_PORT = "/dev/serial/by-id/usb-Silicon_Labs_Acconeer_XE125_R1DNL25061800337-if00-port0"
 
-# --- TUNING PARAMETERS ---
-INTRA_CLUTCH_THRESHOLD = 20.0
-# 2. Adjust for smoothness vs lag. (0.1 = very smooth/laggy, 0.8 = jittery/responsive)
-ALPHA = 0.3
-DEBOUNCE_TIME = 1.0
 MIN_DIST = 0.1
 MAX_DIST = 0.5
+MAX_SWEEP_SEC = 0.6  # MAX SECONDS THE MOTOR CAN DRIVE BEFORE SOFTWARE CUTS POWER
+
+KEY_MODE = 'chippy:mode'
+KEY_MOTORS = 'chippy:cmd:motors'
+KEY_RADAR = 'chippy:state:radar:joystick'
+
+MODE_STEER = "STEER"
 
 
-def map_distance(dist):
-    d = max(MIN_DIST, min(MAX_DIST, dist))
-    mapped = ((d - MIN_DIST) / (MAX_DIST - MIN_DIST)) * 2.0 - 1.0
-    return round(mapped, 2)
+def publish_motor_cmd(v_client, target, direction, speed=0.8):
+    payload = {"target": target, "dir": direction, "speed": speed}
+    v_client.publish(KEY_MOTORS, json.dumps(payload))
 
 
 def run_joystick():
     r = Valkey(host='localhost', port=6379, decode_responses=True)
+    if not r.exists(KEY_MODE):
+        r.set(KEY_MODE, MODE_STEER)
 
     client = a121.Client.open(serial_port=JOYSTICK_RADAR_PORT)
-    config = DetectorConfig(start_m=0.1, end_m=0.6)
+    config = DetectorConfig(
+        start_m=0.15,  # Pushed out from 0.1m to clear chassis reflections
+        end_m=0.6,
+        frame_rate=20.0,
+        intra_detection_threshold=4.0,  # Default is ~1.5. Kills fast ghosting.
+        inter_detection_threshold=3.0  # Kills slow background ghosting.
+    )
     detector = Detector(client=client, sensor_id=1, detector_config=config)
     detector.start()
 
-    mode = "DRIVE"
-    last_toggle_time = time.time()
-    smoothed_dist = None
+    print("Virtual Encoder Joystick running.")
+
+    # --- Time-Based Tracking Variables ---
+    head_pos_sec = 0.0
+    current_dir = "stop"
+    is_homed = True
+    last_loop_time = time.time()
 
     try:
         while True:
+            now = time.time()
+            dt = now - last_loop_time
+            last_loop_time = now
+
             result = detector.get_next()
-
             raw_dist = result.presence_distance
-            intra = result.intra_presence_score
+            mode = r.get(KEY_MODE) or MODE_STEER
 
-            if raw_dist is None:
-                # User removed hand. Reset filter and stop motors.
-                smoothed_dist = None
-                r.set('chippy:cmd:velocity', json.dumps({"v": 0.0, "w": 0.0}))
-                time.sleep(0.05)
-                continue
+            # 1. Update virtual position based on what the motor is currently doing
+            if current_dir == "forward":
+                head_pos_sec += dt
+            elif current_dir == "backward":
+                head_pos_sec -= dt
 
-            # Apply Exponential Moving Average (EMA) Filter
-            if smoothed_dist is None:
-                smoothed_dist = raw_dist  # Initialize filter on first frame
-            else:
-                smoothed_dist = (ALPHA * raw_dist) + ((1.0 - ALPHA) * smoothed_dist)
+            # Clamp the software tracker to limits
+            head_pos_sec = max(-MAX_SWEEP_SEC, min(MAX_SWEEP_SEC, head_pos_sec))
 
-            # Check for Clutch (Hand Shake)
-            current_time = time.time()
-            if intra > INTRA_CLUTCH_THRESHOLD and (current_time - last_toggle_time) > DEBOUNCE_TIME:
-                mode = "STEER" if mode == "DRIVE" else "DRIVE"
-                last_toggle_time = current_time
-                print(f"\n--- MODE SWITCHED TO: {mode} ---\n")
+            if mode == MODE_STEER:
+                if raw_dist is None:
+                    target_pos = 0.0  # Drive back to center
 
-            # Map the SMOOTHED distance to the motor command
-            cmd_val = map_distance(smoothed_dist)
+                    # If we are close to center, hit the real magnet to zero drift
+                    if abs(head_pos_sec) < 0.1 and not is_homed:
+                        publish_motor_cmd(r, "home", "stop", 0.0)
+                        is_homed = True
+                        head_pos_sec = 0.0
+                        current_dir = "stop"
+                        print("[STEER] Hand lost. Homing to magnet.")
+                        continue
+                else:
+                    is_homed = False
+                    # Map 0.1m -> +MAX_SWEEP (up), 0.5m -> -MAX_SWEEP (down)
+                    ratio = (raw_dist - MIN_DIST) / (MAX_DIST - MIN_DIST)
+                    ratio = max(0.0, min(1.0, ratio))
+                    target_pos = MAX_SWEEP_SEC - (ratio * (MAX_SWEEP_SEC * 2))
 
-            if mode == "DRIVE":
-                payload = {"v": cmd_val, "w": 0.0}
-            else:
-                payload = {"v": 0.0, "w": cmd_val}
+                error = target_pos - head_pos_sec
 
-            r.set('chippy:cmd:velocity', json.dumps(payload))
+                # 2. Deadband proportional controller
+                if abs(error) < 0.08:
+                    cmd_dir = "stop"
+                elif error > 0:
+                    cmd_dir = "forward"
+                else:
+                    cmd_dir = "backward"
 
-            print(
-                f"Mode: {mode} | Raw: {raw_dist:.2f}m | Smooth: {smoothed_dist:.2f}m | Intra: {intra:.1f} | Cmd: {payload}")
+                # 3. Virtual Hard Stops (Cut power before physical stall)
+                if cmd_dir == "forward" and head_pos_sec >= MAX_SWEEP_SEC:
+                    cmd_dir = "stop"
+                if cmd_dir == "backward" and head_pos_sec <= -MAX_SWEEP_SEC:
+                    cmd_dir = "stop"
 
-            time.sleep(0.05)
+                # 4. Dispatch only on state change
+                if cmd_dir != current_dir and not is_homed:
+                    current_dir = cmd_dir
+                    speed = 0.8 if cmd_dir != "stop" else 0.0
+                    publish_motor_cmd(r, "head", cmd_dir, speed)
+
+                print(
+                    f"Dist: {raw_dist or 'None':>7} | Virtual Pos: {head_pos_sec:+.2f}s | Target: {target_pos:+.2f}s | Motor: {current_dir}")
 
     except KeyboardInterrupt:
         pass
     finally:
-        detector.stop()
-        client.close()
-        r.set('chippy:cmd:velocity', json.dumps({"v": 0.0, "w": 0.0}))
+        try:
+            detector.stop()
+            client.close()
+        except Exception:
+            pass
+        publish_motor_cmd(r, "head", "stop", 0.0)
+        print("Stopped. Motors zeroed.")
 
 
 if __name__ == "__main__":
