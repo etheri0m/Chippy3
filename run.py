@@ -2,12 +2,21 @@ import subprocess
 import sys
 import time
 import os
+import signal
 
-SCRIPTS = [
-    ("Hardware",    "core_hardware.py"),
+# Set SKIP_HARDWARE=1 to run without core_hardware.py (no motors)
+SKIP_HARDWARE = os.environ.get("SKIP_HARDWARE", "0") == "1"
+
+SCRIPTS = []
+
+if not SKIP_HARDWARE:
+    SCRIPTS.append(("Hardware",    "core_hardware.py"))
+
+SCRIPTS += [
     ("Radar",       "core_radar.py"),
     ("Kinematics",  "core_kinematics.py"),
-    ("Joystick",    "core_joystick.py"),
+    ("Controller",  "core_joystick.py"),
+    ("Dashboard",   "main.py"),
 ]
 
 processes = []
@@ -19,7 +28,6 @@ def shutdown(sig=None, frame=None):
         print(f"[Run] Stopped {name}")
     sys.exit(0)
 
-import signal
 signal.signal(signal.SIGINT, shutdown)
 signal.signal(signal.SIGTERM, shutdown)
 
@@ -41,18 +49,22 @@ for name, script in SCRIPTS:
     else:
         time.sleep(1)
 
+if SKIP_HARDWARE:
+    print("[Run] Hardware SKIPPED (no motors).")
+
 print("\n[Run] All systems up. Ctrl+C to stop everything.\n")
 
 # Watch for any process dying unexpectedly
 while True:
-    for name, proc in processes:
+    for i, (name, proc) in enumerate(processes):
         if proc.poll() is not None:
             print(f"[Run] WARNING: {name} died (exit {proc.returncode}) — restarting...")
-            path = next(s for n, s in SCRIPTS if n == name)
+            path = os.path.join(os.path.dirname(__file__),
+                                next(s for n, s in SCRIPTS if n == name))
             new_proc = subprocess.Popen(
                 [sys.executable, path],
                 stdout=sys.stdout,
                 stderr=sys.stderr,
             )
-            processes[processes.index((name, proc))] = (name, new_proc)
+            processes[i] = (name, new_proc)
     time.sleep(2)

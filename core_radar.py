@@ -6,9 +6,9 @@ from acconeer.exptool import a121
 from acconeer.exptool.a121.algo.presence import Detector, DetectorConfig
 
 # Two separate physical radars, two separate serial IDs.
-# The joystick radar (337) is exclusively owned by core_joystick.py.
+# The rear radar (337) is exclusively owned by core_joystick.py.
 # This file only runs the front-facing radar.
-FRONT_RADAR_PORT = "/dev/serial/by-id/usb-Silicon_Labs_Acconeer_XE125_R1DNL25061800352-if00-port0"
+FRONT_RADAR_PORT = "/dev/serial/by-id/usb-Silicon_Labs_Acconeer_XE125_R1DNL25061800337-if00-port0"
 
 KEY_FRONT = "chippy:state:radar:front"
 
@@ -19,7 +19,7 @@ def radar_worker(port: str, state_key: str):
 
     config = DetectorConfig(
         frame_rate=20.0,
-        start_m=0.2,
+        start_m=0.10,                  # Close range for hand tracking in FOLLOW
         end_m=2.0,                     # Front radar scans further for obstacle/crowd use
         intra_detection_threshold=4.0,
         inter_detection_threshold=3.0,

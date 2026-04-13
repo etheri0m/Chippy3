@@ -1,5 +1,6 @@
 """
 ChippyPi — NiceGUI Dashboard
+Run:   python3 main.py
 Open:  http://<pi-ip>:8080
 
 Reads all Valkey state keys, displays live data, allows mode switching.
@@ -7,11 +8,10 @@ No motors or radar — purely a display/control layer.
 """
 
 import json
+import math
+import random
 import time
 from nicegui import ui
-from valkey import Valkey
-
-vk = Valkey(host="localhost", port=6379, decode_responses=True)
 
 # ── Valkey keys ──────────────────────────────────────────────────────────────
 KEYS = {
@@ -19,7 +19,7 @@ KEYS = {
     "head":        "chippy:state:head",
     "kinematics":  "chippy:state:kinematics",
     "radar_front": "chippy:state:radar:front",
-    "radar_joy":   "chippy:state:radar:joystick",
+    "radar_rear":  "chippy:state:radar:rear",
     "crowd":       "chippy:state:crowd",
     "maze":        "chippy:state:maze",
 }
@@ -27,10 +27,97 @@ KEYS = {
 VALID_MODES = ["FOLLOW", "CROWD", "MAZE"]
 POLL_INTERVAL = 0.2  # seconds
 
+# ── Try Valkey, fall back to demo mode ───────────────────────────────────────
+DEMO_MODE = False
+vk = None
+
+try:
+    from valkey import Valkey
+    vk = Valkey(host="localhost", port=6379, decode_responses=True)
+    vk.ping()
+    print("[Dashboard] Connected to Valkey.")
+except Exception:
+    DEMO_MODE = True
+    print("[Dashboard] Valkey unavailable — running in DEMO mode with fake data.")
+
+
+# ── Demo state (used when Valkey is not available) ───────────────────────────
+_demo_state = {
+    "mode": "FOLLOW",
+}
+
+
+def _demo_data() -> dict:
+    """Generate fake but realistic-looking sensor data for UI work."""
+    t = time.time()
+    mode = _demo_state["mode"]
+
+    # Simulate some wobble
+    intra_f = abs(math.sin(t * 0.7)) * 8.0 + random.uniform(0, 2)
+    inter_f = abs(math.cos(t * 0.4)) * 6.0 + random.uniform(0, 1.5)
+    intra_j = abs(math.sin(t * 1.1)) * 10.0 + random.uniform(0, 1)
+    inter_j = abs(math.cos(t * 0.8)) * 4.0 + random.uniform(0, 1)
+    dist_f  = 0.3 + math.sin(t * 0.5) * 0.15
+    dist_j  = 0.25 + math.sin(t * 0.3) * 0.1
+
+    det_f = intra_f > 4.0
+    det_j = intra_j > 5.0
+
+    # Crowd classification
+    avg_inter = inter_f
+    if avg_inter >= 8.0:
+        density = "BUSY"
+    elif avg_inter >= 3.0:
+        density = "LOW"
+    else:
+        density = "EMPTY"
+
+    # Leg direction based on rear radar distance
+    if det_j and dist_j < 0.20:
+        leg_dir, v = "backward", -0.7
+    elif det_j and dist_j > 0.30:
+        leg_dir, v = "forward", 0.7
+    else:
+        leg_dir, v = "stop", 0.0
+
+    head_dir = "forward" if det_f else "stop"
+    w = 0.5 if det_f else 0.0
+
+    maze_step = int((t % 12) / 2) + 1
+
+    return {
+        "mode": mode,
+        "head": {"calibrated": True, "position": 0},
+        "kinematics": {
+            "v": round(v, 3), "w": round(w, 3),
+            "leg_dir": leg_dir, "head_dir": head_dir,
+            "ts": round(t, 4),
+        },
+        "radar_front": {
+            "detected": det_f, "dist": round(dist_f, 3) if det_f else None,
+            "intra": round(intra_f, 2), "inter": round(inter_f, 2), "ts": round(t, 4),
+        },
+        "radar_rear": {
+            "detected": det_j, "dist": round(dist_j, 3) if det_j else None,
+            "intra": round(intra_j, 2), "inter": round(inter_j, 2), "ts": round(t, 4),
+        },
+        "crowd": {
+            "density": density, "avg_inter": round(avg_inter, 2),
+            "avg_intra": round(intra_f, 2), "detected": det_f,
+            "dist": round(dist_f, 3) if det_f else None, "ts": round(t, 4),
+        },
+        "maze": {
+            "status": "RUNNING", "step": min(maze_step, 6),
+            "total_steps": 6, "obstacle": random.random() < 0.1, "ts": round(t, 4),
+        },
+    }
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def vk_get(key: str) -> dict | None:
+    if DEMO_MODE:
+        return None  # handled by _demo_data() in poll
     raw = vk.get(key)
     if raw:
         try:
@@ -41,10 +128,15 @@ def vk_get(key: str) -> dict | None:
 
 
 def publish_velocity(v: float, w: float):
+    if DEMO_MODE:
+        return
     vk.publish("chippy:cmd:velocity", json.dumps({"v": v, "w": w}))
 
 
 def set_mode(mode: str):
+    if DEMO_MODE:
+        _demo_state["mode"] = mode
+        return
     vk.set(KEYS["mode"], mode)
 
 
@@ -199,39 +291,39 @@ def dashboard():
 
         # ── JOYSTICK RADAR ──
         with ui.card().classes("p-4"):
-            ui.label("Joystick Radar").classes("card-title")
+            ui.label("Rear Radar").classes("card-title")
             with ui.column().classes("gap-1"):
                 with ui.row().classes("w-full justify-between"):
                     ui.label("Presence").classes("data-label")
-                    joy_det = ui.label("—").classes("data-value")
+                    rear_det = ui.label("—").classes("data-value")
                 with ui.row().classes("w-full justify-between"):
                     ui.label("Distance").classes("data-label")
-                    joy_dist = ui.label("—").classes("data-value")
+                    rear_dist = ui.label("—").classes("data-value")
             ui.label("intra").style("font-size:11px; color:#6b6b76; margin-top:8px;")
-            joy_intra_bar = ui.linear_progress(value=0, show_value=False).style(
+            rear_intra_bar = ui.linear_progress(value=0, show_value=False).style(
                 "height:14px;"
             ).props("color='light-blue'")
-            joy_intra_val = ui.label("0").style("font-size:11px; font-weight:600;")
+            rear_intra_val = ui.label("0").style("font-size:11px; font-weight:600;")
             ui.label("inter").style("font-size:11px; color:#6b6b76; margin-top:4px;")
-            joy_inter_bar = ui.linear_progress(value=0, show_value=False).style(
+            rear_inter_bar = ui.linear_progress(value=0, show_value=False).style(
                 "height:14px;"
             ).props("color='amber'")
-            joy_inter_val = ui.label("0").style("font-size:11px; font-weight:600;")
+            rear_inter_val = ui.label("0").style("font-size:11px; font-weight:600;")
 
         # ── CROWD ──
         with ui.card().classes("p-4"):
             ui.label("Crowd Density").classes("card-title")
-            crowd_badge = ui.html('<span class="density-badge">—</span>')
-            ui.label("avg inter").style("font-size:11px; color:#6b6b76; margin-top:10px;")
-            crowd_inter_bar = ui.linear_progress(value=0, show_value=False).style(
-                "height:14px;"
-            ).props("color='amber'")
-            crowd_inter_val = ui.label("0").style("font-size:11px; font-weight:600;")
-            ui.label("avg intra").style("font-size:11px; color:#6b6b76; margin-top:4px;")
+            crowd_badge = ui.html('<span class="density-badge">—</span>', sanitize=False)
+            ui.label("avg intra").style("font-size:11px; color:#6b6b76; margin-top:10px;")
             crowd_intra_bar = ui.linear_progress(value=0, show_value=False).style(
                 "height:14px;"
             ).props("color='light-blue'")
             crowd_intra_val = ui.label("0").style("font-size:11px; font-weight:600;")
+            ui.label("avg inter").style("font-size:11px; color:#6b6b76; margin-top:4px;")
+            crowd_inter_bar = ui.linear_progress(value=0, show_value=False).style(
+                "height:14px;"
+            ).props("color='amber'")
+            crowd_inter_val = ui.label("0").style("font-size:11px; font-weight:600;")
             with ui.column().classes("gap-1 mt-2"):
                 with ui.row().classes("w-full justify-between"):
                     ui.label("Presence").classes("data-label")
@@ -279,8 +371,25 @@ def dashboard():
 
     def poll():
         try:
+            if DEMO_MODE:
+                d = _demo_data()
+                mode = d["mode"]
+                head = d["head"]
+                kin  = d["kinematics"]
+                rf   = d["radar_front"]
+                rj   = d["radar_rear"]
+                cr   = d["crowd"]
+                mz   = d["maze"]
+            else:
+                mode = vk.get(KEYS["mode"]) or "—"
+                head = vk_get(KEYS["head"])
+                kin  = vk_get(KEYS["kinematics"])
+                rf   = vk_get(KEYS["radar_front"])
+                rj   = vk_get(KEYS["radar_rear"])
+                cr   = vk_get(KEYS["crowd"])
+                mz   = vk_get(KEYS["maze"])
+
             # Mode
-            mode = vk.get(KEYS["mode"]) or "—"
             mode_label.text = mode
             for m, btn in mode_btns.items():
                 if m == mode:
@@ -297,7 +406,6 @@ def dashboard():
                     )
 
             # Head
-            head = vk_get(KEYS["head"])
             if head:
                 cal = head.get("calibrated", False)
                 head_cal.text = "YES" if cal else "NO"
@@ -306,7 +414,6 @@ def dashboard():
                 head_pos.text = str(pos) if pos is not None else "—"
 
             # Kinematics
-            kin = vk_get(KEYS["kinematics"])
             if kin:
                 kin_v.text = fmt(kin.get("v"), 3)
                 kin_w.text = fmt(kin.get("w"), 3)
@@ -318,7 +425,6 @@ def dashboard():
                 head_icon.text = dir_arrow(hd)
 
             # Front radar
-            rf = vk_get(KEYS["radar_front"])
             if rf:
                 front_det.text = "YES" if rf.get("detected") else "no"
                 d = rf.get("dist")
@@ -328,19 +434,17 @@ def dashboard():
                 front_inter_bar.value = bar_pct(rf.get("inter", 0))
                 front_inter_val.text = fmt(rf.get("inter", 0), 1)
 
-            # Joystick radar
-            rj = vk_get(KEYS["radar_joy"])
+            # Rear radar
             if rj:
-                joy_det.text = "YES" if rj.get("detected") else "no"
+                rear_det.text = "YES" if rj.get("detected") else "no"
                 d = rj.get("dist")
-                joy_dist.text = f"{fmt(d, 3)} m" if d is not None else "—"
-                joy_intra_bar.value = bar_pct(rj.get("intra", 0))
-                joy_intra_val.text = fmt(rj.get("intra", 0), 1)
-                joy_inter_bar.value = bar_pct(rj.get("inter", 0))
-                joy_inter_val.text = fmt(rj.get("inter", 0), 1)
+                rear_dist.text = f"{fmt(d, 3)} m" if d is not None else "—"
+                rear_intra_bar.value = bar_pct(rj.get("intra", 0))
+                rear_intra_val.text = fmt(rj.get("intra", 0), 1)
+                rear_inter_bar.value = bar_pct(rj.get("inter", 0))
+                rear_inter_val.text = fmt(rj.get("inter", 0), 1)
 
             # Crowd
-            cr = vk_get(KEYS["crowd"])
             if cr:
                 density = cr.get("density", "—")
                 color = DENSITY_COLORS.get(density, "#6b6b76")
@@ -358,7 +462,6 @@ def dashboard():
                 crowd_dist.text = f"{fmt(d, 3)} m" if d is not None else "—"
 
             # Maze
-            mz = vk_get(KEYS["maze"])
             if mz:
                 maze_status.text = mz.get("status", "—")
                 step = mz.get("step", 0)
@@ -368,8 +471,12 @@ def dashboard():
                 maze_bar.value = (step / total) if total > 0 else 0
 
             # Connection indicator
-            conn_dot.style("font-size:10px; color:#00d4aa;")
-            conn_text.text = "live"
+            if DEMO_MODE:
+                conn_dot.style("font-size:10px; color:#ffc44a;")
+                conn_text.text = "demo"
+            else:
+                conn_dot.style("font-size:10px; color:#00d4aa;")
+                conn_text.text = "live"
 
         except Exception as e:
             conn_dot.style("font-size:10px; color:#ff4a6b;")

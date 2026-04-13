@@ -5,18 +5,23 @@ from valkey import Valkey
 from acconeer.exptool import a121
 from acconeer.exptool.a121.algo.presence import Detector, DetectorConfig
 
-JOYSTICK_RADAR_PORT = "/dev/serial/by-id/usb-Silicon_Labs_Acconeer_XE125_R1DNL25061800337-if00-port0"
+REAR_RADAR_PORT = "/dev/serial/by-id/usb-Silicon_Labs_Acconeer_XE125_R1DNL25061800352-if00-port0"
 
 # --- FOLLOW mode ---
-# Hand distance zones:
+# Front radar hand distance zones:
 #   < NEAR_ZONE  → robot backs away
 #   > FAR_ZONE   → robot walks toward hand
 #   between      → robot holds still (neutral dead zone)
-NEAR_ZONE    = 0.20   # metres — hand closer than this = back up
-FAR_ZONE     = 0.30   # metres — hand further than this = walk forward
-FOLLOW_SPEED = 0.7    # leg motor speed (0.0–1.0)
+# Hand detection requires BOTH:
+#   - distance within MAX_HAND_DIST (filters out bystanders standing further away)
+#   - intra score above MIN_HAND_INTRA (filters out still objects / people not moving)
+NEAR_ZONE      = 0.20   # metres — hand closer than this = back up
+FAR_ZONE       = 0.30   # metres — hand further than this = walk forward
+MAX_HAND_DIST  = 0.50   # metres — anything beyond this is ignored (not a hand)
+FOLLOW_SPEED   = 0.7    # leg motor speed (0.0–1.0)
+MIN_HAND_INTRA = 4.0    # intra score below this = hand gone (cuts through lingering inter)
 
-# Head sweep (uses FRONT radar, not joystick radar)
+# Head sweep (front radar)
 # When front radar loses presence, head sweeps back and forth until it finds something
 SWEEP_SPEED    = 0.8   # slow sweep so it doesn't overshoot
 SWEEP_DURATION = 0.8   # seconds in each sweep direction before reversing
@@ -28,7 +33,8 @@ CROWD_HIGH_THRESHOLD = 8.0
 CROWD_LOW_THRESHOLD  = 3.0
 
 # --- MAZE mode ---
-MAZE_OBSTACLE_DIST = 0.35
+MAZE_FRONT_OBSTACLE_DIST = 0.35   # forward obstacle guard
+MAZE_REAR_OBSTACLE_DIST  = 0.25   # rear safety guard
 MAZE_SEQUENCE = [
     {"v": 0.7, "w": 0.0,  "duration": 1.5},
     {"v": 0.0, "w": 0.8,  "duration": 0.4},
@@ -39,12 +45,12 @@ MAZE_SEQUENCE = [
 ]
 
 # --- Valkey keys ---
-KEY_MODE     = 'chippy:mode'
-KEY_VELOCITY = 'chippy:cmd:velocity'
-KEY_RADAR_JS = 'chippy:state:radar:joystick'
-KEY_RADAR_FR = 'chippy:state:radar:front'
-KEY_CROWD    = 'chippy:state:crowd'
-KEY_MAZE     = 'chippy:state:maze'
+KEY_MODE       = 'chippy:mode'
+KEY_VELOCITY   = 'chippy:cmd:velocity'
+KEY_RADAR_REAR = 'chippy:state:radar:rear'
+KEY_RADAR_FR   = 'chippy:state:radar:front'
+KEY_CROWD      = 'chippy:state:crowd'
+KEY_MAZE       = 'chippy:state:maze'
 
 MODE_FOLLOW = "FOLLOW"
 MODE_CROWD  = "CROWD"
@@ -66,9 +72,19 @@ def read_front_radar(r) -> dict:
     return {"detected": False, "dist": None, "intra": 0.0, "inter": 0.0}
 
 
+def read_rear_radar(r) -> dict:
+    raw = r.get(KEY_RADAR_REAR)
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+    return {"detected": False, "dist": None, "intra": 0.0, "inter": 0.0}
+
+
 # ---------------------------------------------------------------------------
-# Head sweep-and-lock (shared across modes that need it)
-# Uses FRONT radar only. Joystick radar is NOT involved.
+# Head sweep-and-lock
+# Uses FRONT radar only.
 # ---------------------------------------------------------------------------
 
 class HeadSweep:
@@ -106,13 +122,11 @@ class HeadSweep:
             publish_velocity(self.r, v, w)
             self.last_w = w
 
-    def update(self, leg_v: float = 0.0):
+    def update(self, front: dict, leg_v: float = 0.0):
         """
-        Call every loop. leg_v is the leg velocity the caller wants —
-        head sweep piggybacks on the same velocity publish.
+        Call every loop with front radar data and desired leg velocity.
+        Head sweep piggybacks on the same velocity publish.
         """
-        front = read_front_radar(self.r)
-
         if front["detected"]:
             # Locked onto something — stop head
             if self.state != self.LOCKED:
@@ -154,19 +168,20 @@ class HeadSweep:
 
 
 # ---------------------------------------------------------------------------
-# FOLLOW mode
+# FOLLOW mode — front radar drives BOTH legs and head
 # ---------------------------------------------------------------------------
 
 class FollowMode:
     """
-    Joystick radar controls leg direction based on hand distance.
-    Front radar controls head via HeadSweep (sweep-and-lock).
+    Front radar controls everything:
+      - Hand distance zones drive legs (forward / backward / hold / stop)
+      - Presence detection drives head via HeadSweep (sweep-and-lock)
 
     Zones:
       hand < NEAR_ZONE  → back away  (v = -FOLLOW_SPEED)
       hand > FAR_ZONE   → approach   (v = +FOLLOW_SPEED)
       between           → hold still (v = 0.0)
-      hand gone         → stop legs, head keeps sweeping
+      hand gone         → stop legs, head sweeps looking for target
     """
 
     def __init__(self, r):
@@ -179,7 +194,20 @@ class FollowMode:
         publish_velocity(self.r, 0.0, 0.0)
         self.last_v = None
 
-    def update(self, raw_dist):
+    def update(self):
+        front = read_front_radar(self.r)
+
+        # Gate on distance + intra score:
+        #   - MAX_HAND_DIST filters out people standing further away
+        #   - MIN_HAND_INTRA filters out still objects (inter lingers, intra drops fast)
+        hand_present = (
+            front["detected"] and
+            front["dist"] is not None and
+            front["dist"] <= MAX_HAND_DIST and
+            front.get("intra", 0.0) >= MIN_HAND_INTRA
+        )
+        raw_dist = front["dist"] if hand_present else None
+
         if raw_dist is None:
             leg_v = 0.0
             zone  = "NONE"
@@ -194,17 +222,18 @@ class FollowMode:
             zone  = "HOLD"
 
         # Head sweep handles its own publish including leg_v
-        head_state = self.head.update(leg_v)
+        head_state = self.head.update(front, leg_v)
 
         dist_str = f"{raw_dist:.3f}m" if raw_dist is not None else "None   "
+        intra_str = f"{front.get('intra', 0.0):.1f}"
         print(
             f"[FOLLOW] Hand: {dist_str} | Zone: {zone:4} | "
-            f"Legs: {leg_v:+.1f} | Head: {head_state}"
+            f"Legs: {leg_v:+.1f} | Head: {head_state} | Intra: {intra_str}"
         )
 
 
 # ---------------------------------------------------------------------------
-# CROWD mode
+# CROWD mode — uses BOTH radars for wider coverage
 # ---------------------------------------------------------------------------
 
 class CrowdMode:
@@ -227,18 +256,25 @@ class CrowdMode:
 
     def update(self):
         front = read_front_radar(self.r)
-        self.inter_window.append(front["inter"])
-        self.intra_window.append(front["intra"])
+        rear  = read_rear_radar(self.r)
+
+        # Combine both radars: take the max of each score for wider coverage
+        combined_inter = max(front["inter"], rear["inter"])
+        combined_intra = max(front["intra"], rear["intra"])
+
+        self.inter_window.append(combined_inter)
+        self.intra_window.append(combined_intra)
 
         avg_inter = sum(self.inter_window) / len(self.inter_window)
         avg_intra = sum(self.intra_window) / len(self.intra_window)
         density   = self._classify(avg_inter)
 
+        # Report front radar for distance (forward-facing is more useful)
         self.r.set(KEY_CROWD, json.dumps({
             "density":   density,
             "avg_inter": round(avg_inter, 2),
             "avg_intra": round(avg_intra, 2),
-            "detected":  front["detected"],
+            "detected":  front["detected"] or rear["detected"],
             "dist":      front["dist"],
             "ts":        round(time.time(), 4),
         }))
@@ -247,7 +283,7 @@ class CrowdMode:
 
 
 # ---------------------------------------------------------------------------
-# MAZE mode
+# MAZE mode — front for forward obstacles, rear for backward safety
 # ---------------------------------------------------------------------------
 
 class MazeMode:
@@ -295,16 +331,32 @@ class MazeMode:
 
         s     = MAZE_SEQUENCE[self.step]
         front = read_front_radar(self.r)
-        obstacle_now = (
+        rear  = read_rear_radar(self.r)
+
+        # Forward obstacle: only matters when moving forward (v > 0)
+        front_blocked = (
+            s["v"] > 0 and
             front["detected"] and
             front["dist"] is not None and
-            front["dist"] < MAZE_OBSTACLE_DIST
+            front["dist"] < MAZE_FRONT_OBSTACLE_DIST
         )
+
+        # Rear safety: only matters when moving backward (v < 0)
+        rear_blocked = (
+            s["v"] < 0 and
+            rear["detected"] and
+            rear["dist"] is not None and
+            rear["dist"] < MAZE_REAR_OBSTACLE_DIST
+        )
+
+        obstacle_now = front_blocked or rear_blocked
 
         if obstacle_now and not self.obstacle_hold:
             self.obstacle_hold = True
             publish_velocity(self.r, 0.0, s["w"])
-            print(f"[MAZE ] Obstacle at {front['dist']:.2f}m — legs paused.")
+            direction = "front" if front_blocked else "rear"
+            dist = front["dist"] if front_blocked else rear["dist"]
+            print(f"[MAZE ] {direction} obstacle at {dist:.2f}m — legs paused.")
             self._publish_state("OBSTACLE_HOLD")
         elif not obstacle_now and self.obstacle_hold:
             self.obstacle_hold = False
@@ -328,21 +380,30 @@ class MazeMode:
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run_joystick():
+def run_controller():
     r = Valkey(host='localhost', port=6379, decode_responses=True)
     if not r.exists(KEY_MODE):
         r.set(KEY_MODE, MODE_FOLLOW)
 
-    client = a121.Client.open(serial_port=JOYSTICK_RADAR_PORT)
-    config = DetectorConfig(
-        start_m=0.10,
-        end_m=0.5,
-        frame_rate=20.0,
-        intra_detection_threshold=5.0,
-        inter_detection_threshold=4.0,
-    )
-    detector = Detector(client=client, sensor_id=1, detector_config=config)
-    detector.start()
+    # Rear radar is optional — FOLLOW only needs front, CROWD/MAZE degrade gracefully
+    rear_detector = None
+    rear_client   = None
+    try:
+        rear_client = a121.Client.open(serial_port=REAR_RADAR_PORT)
+        config = DetectorConfig(
+            start_m=0.10,
+            end_m=0.5,
+            frame_rate=20.0,
+            intra_detection_threshold=5.0,
+            inter_detection_threshold=4.0,
+        )
+        rear_detector = Detector(client=rear_client, sensor_id=1, detector_config=config)
+        rear_detector.start()
+        print("[Controller] Rear radar connected.")
+    except Exception as e:
+        print(f"[Controller] Rear radar unavailable ({e}) — running without it.")
+        rear_client   = None
+        rear_detector = None
 
     follow = FollowMode(r)
     crowd  = CrowdMode(r)
@@ -350,29 +411,36 @@ def run_joystick():
 
     active_mode = None
 
-    print("Joystick running.")
-    print(f"Modes: redis-cli set {KEY_MODE} FOLLOW|CROWD|MAZE\n")
-    print(f"FOLLOW zones: <{NEAR_ZONE}m back up | {NEAR_ZONE}-{FAR_ZONE}m hold | >{FAR_ZONE}m walk forward\n")
+    if rear_detector:
+        print("[Controller] Running — rear radar active.")
+    else:
+        print("[Controller] Running — front radar only.")
+    print(f"[Controller] Modes: redis-cli set {KEY_MODE} FOLLOW|CROWD|MAZE")
+    print(f"[Controller] FOLLOW zones: <{NEAR_ZONE}m back | {NEAR_ZONE}-{FAR_ZONE}m hold | >{FAR_ZONE}m forward\n")
 
     try:
         while True:
-            result   = detector.get_next()
-            detected = result.presence_detected
-            raw_dist = result.presence_distance if detected else None
-            intra    = result.intra_presence_score
-            inter    = result.inter_presence_score
+            # If rear radar is connected, it drives the loop timing.
+            # Otherwise, sleep at ~20Hz to match front radar frame rate.
+            if rear_detector:
+                result   = rear_detector.get_next()
+                detected = result.presence_detected
+                raw_dist = result.presence_distance if detected else None
+                intra    = result.intra_presence_score
+                inter    = result.inter_presence_score
+
+                r.set(KEY_RADAR_REAR, json.dumps({
+                    "detected": detected,
+                    "dist":     raw_dist,
+                    "intra":    round(intra, 2),
+                    "inter":    round(inter, 2),
+                    "ts":       round(time.time(), 4),
+                }))
+            else:
+                time.sleep(0.05)  # ~20Hz
 
             raw_mode = r.get(KEY_MODE)
             mode     = raw_mode if raw_mode in VALID_MODES else MODE_FOLLOW
-
-            # Publish joystick radar state every frame
-            r.set(KEY_RADAR_JS, json.dumps({
-                "detected": detected,
-                "dist":     raw_dist,
-                "intra":    round(intra, 2),
-                "inter":    round(inter, 2),
-                "ts":       round(time.time(), 4),
-            }))
 
             # Mode transition
             if mode != active_mode:
@@ -383,7 +451,7 @@ def run_joystick():
                 active_mode = mode
 
             if mode == MODE_FOLLOW:
-                follow.update(raw_dist)
+                follow.update()
             elif mode == MODE_CROWD:
                 crowd.update()
             elif mode == MODE_MAZE:
@@ -393,13 +461,15 @@ def run_joystick():
         pass
     finally:
         try:
-            detector.stop()
-            client.close()
+            if rear_detector:
+                rear_detector.stop()
+            if rear_client:
+                rear_client.close()
         except Exception:
             pass
         publish_velocity(r, 0.0, 0.0)
-        print("Stopped.")
+        print("[Controller] Stopped.")
 
 
 if __name__ == "__main__":
-    run_joystick()
+    run_controller()
