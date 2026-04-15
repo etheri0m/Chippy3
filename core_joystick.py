@@ -1,7 +1,8 @@
+import asyncio
 import time
-import json
 import collections
-from valkey import Valkey
+import orjson
+import valkey.asyncio as avalkey
 from acconeer.exptool import a121
 from acconeer.exptool.a121.algo.presence import Detector, DetectorConfig
 from log_config import get_logger
@@ -17,7 +18,6 @@ MAX_HAND_DIST  = 0.50
 FOLLOW_SPEED   = 0.7
 MIN_HAND_INTRA = 4.0
 
-# Head sweep (front radar)
 SWEEP_SPEED    = 0.8
 SWEEP_DURATION = 0.8
 SWEEP_TIMEOUT  = 3.0
@@ -53,25 +53,25 @@ MODE_MAZE   = "MAZE"
 VALID_MODES = {MODE_FOLLOW, MODE_CROWD, MODE_MAZE}
 
 
-def publish_velocity(r, v: float, w: float):
-    r.publish(KEY_VELOCITY, json.dumps({"v": round(v, 3), "w": round(w, 3)}))
+async def publish_velocity(r, v: float, w: float):
+    await r.publish(KEY_VELOCITY, orjson.dumps({"v": round(v, 3), "w": round(w, 3)}).decode())
 
 
-def read_front_radar(r) -> dict:
-    raw = r.get(KEY_RADAR_FR)
+async def read_front_radar(r) -> dict:
+    raw = await r.get(KEY_RADAR_FR)
     if raw:
         try:
-            return json.loads(raw)
+            return orjson.loads(raw)
         except Exception:
             pass
     return {"detected": False, "dist": None, "intra": 0.0, "inter": 0.0}
 
 
-def read_rear_radar(r) -> dict:
-    raw = r.get(KEY_RADAR_REAR)
+async def read_rear_radar(r) -> dict:
+    raw = await r.get(KEY_RADAR_REAR)
     if raw:
         try:
-            return json.loads(raw)
+            return orjson.loads(raw)
         except Exception:
             pass
     return {"detected": False, "dist": None, "intra": 0.0, "inter": 0.0}
@@ -95,27 +95,26 @@ class HeadSweep:
         self.last_w       = None
         self.hlog         = get_logger("Head")
 
-    def reset(self):
-        self._send_w(0.0)
+    async def reset(self):
+        await self._send_w(0.0)
         self.state       = self.STOPPED
         self.sweep_start = None
         self.sweep_total = None
         self.last_w      = None
 
-    def _send_w(self, w: float, v: float = 0.0):
+    async def _send_w(self, w: float, v: float = 0.0):
         if w != self.last_w:
-            publish_velocity(self.r, v, w)
+            await publish_velocity(self.r, v, w)
             self.last_w = w
 
-    def update(self, front: dict, leg_v: float = 0.0):
+    async def update(self, front: dict, leg_v: float = 0.0):
         if front["detected"]:
             if self.state != self.LOCKED:
                 self.state       = self.LOCKED
                 self.sweep_start = None
                 self.sweep_total = None
                 self.hlog.info("Locked on target")
-            self._send_w(0.0, leg_v)
-
+            await self._send_w(0.0, leg_v)
         else:
             if self.state == self.LOCKED:
                 self.state       = self.SWEEPING
@@ -126,19 +125,18 @@ class HeadSweep:
 
             if self.state == self.SWEEPING:
                 elapsed_total = time.time() - self.sweep_total
-
                 if elapsed_total >= SWEEP_TIMEOUT:
                     self.state = self.STOPPED
-                    self._send_w(0.0, leg_v)
+                    await self._send_w(0.0, leg_v)
                     self.hlog.info("Sweep timeout — stopped")
                 else:
                     if time.time() - self.sweep_start >= SWEEP_DURATION:
                         self.sweep_dir  = -self.sweep_dir
                         self.sweep_start = time.time()
-                    self._send_w(self.sweep_dir * SWEEP_SPEED, leg_v)
+                    await self._send_w(self.sweep_dir * SWEEP_SPEED, leg_v)
 
             elif self.state == self.STOPPED:
-                self._send_w(0.0, leg_v)
+                await self._send_w(0.0, leg_v)
 
         return self.state
 
@@ -154,13 +152,13 @@ class FollowMode:
         self.last_v = None
         self.flog = get_logger("Follow")
 
-    def reset(self):
-        self.head.reset()
-        publish_velocity(self.r, 0.0, 0.0)
+    async def reset(self):
+        await self.head.reset()
+        await publish_velocity(self.r, 0.0, 0.0)
         self.last_v = None
 
-    def update(self):
-        front = read_front_radar(self.r)
+    async def update(self):
+        front = await read_front_radar(self.r)
 
         hand_present = (
             front["detected"] and
@@ -183,7 +181,7 @@ class FollowMode:
             leg_v = 0.0
             zone  = "HOLD"
 
-        head_state = self.head.update(front, leg_v)
+        head_state = await self.head.update(front, leg_v)
 
         dist_str = f"{raw_dist:.3f}m" if raw_dist is not None else "None   "
         intra_str = f"{front.get('intra', 0.0):.1f}"
@@ -204,8 +202,8 @@ class CrowdMode:
         self.intra_window = collections.deque(maxlen=CROWD_WINDOW_FRAMES)
         self.clog         = get_logger("Crowd")
 
-    def reset(self):
-        publish_velocity(self.r, 0.0, 0.0)
+    async def reset(self):
+        await publish_velocity(self.r, 0.0, 0.0)
         self.inter_window.clear()
         self.intra_window.clear()
 
@@ -216,9 +214,9 @@ class CrowdMode:
             return "LOW"
         return "EMPTY"
 
-    def update(self):
-        front = read_front_radar(self.r)
-        rear  = read_rear_radar(self.r)
+    async def update(self):
+        front = await read_front_radar(self.r)
+        rear  = await read_rear_radar(self.r)
 
         combined_inter = max(front["inter"], rear["inter"])
         combined_intra = max(front["intra"], rear["intra"])
@@ -230,14 +228,14 @@ class CrowdMode:
         avg_intra = sum(self.intra_window) / len(self.intra_window)
         density   = self._classify(avg_inter)
 
-        self.r.set(KEY_CROWD, json.dumps({
+        await self.r.set(KEY_CROWD, orjson.dumps({
             "density":   density,
             "avg_inter": round(avg_inter, 2),
             "avg_intra": round(avg_intra, 2),
             "detected":  front["detected"] or rear["detected"],
             "dist":      front["dist"],
             "ts":        round(time.time(), 4),
-        }))
+        }).decode())
 
         self.clog.debug("{:5} | Inter: {:5.1f} | Intra: {:5.1f}", density, avg_inter, avg_intra)
 
@@ -255,46 +253,46 @@ class MazeMode:
         self.obstacle_hold = False
         self.mlog          = get_logger("Maze")
 
-    def reset(self):
-        publish_velocity(self.r, 0.0, 0.0)
+    async def reset(self):
+        await publish_velocity(self.r, 0.0, 0.0)
         self.step          = 0
         self.step_start    = None
         self.active        = False
         self.obstacle_hold = False
 
-    def start(self):
+    async def start(self):
         self.step          = 0
         self.step_start    = time.time()
         self.active        = True
         self.obstacle_hold = False
-        self._dispatch_step()
+        await self._dispatch_step()
 
-    def _dispatch_step(self):
+    async def _dispatch_step(self):
         s = MAZE_SEQUENCE[self.step]
-        publish_velocity(self.r, s["v"], s["w"])
+        await publish_velocity(self.r, s["v"], s["w"])
         self.mlog.info(
             "Step {}/{} — v:{:+.1f} w:{:+.1f} for {}s",
             self.step + 1, len(MAZE_SEQUENCE), s['v'], s['w'], s['duration']
         )
-        self._publish_state("RUNNING")
+        await self._publish_state("RUNNING")
 
-    def _publish_state(self, status: str):
-        self.r.set(KEY_MAZE, json.dumps({
+    async def _publish_state(self, status: str):
+        await self.r.set(KEY_MAZE, orjson.dumps({
             "status":      status,
             "step":        self.step + 1,
             "total_steps": len(MAZE_SEQUENCE),
             "obstacle":    self.obstacle_hold,
             "ts":          round(time.time(), 4),
-        }))
+        }).decode())
 
-    def update(self):
+    async def update(self):
         if not self.active:
-            self.start()
+            await self.start()
             return
 
         s     = MAZE_SEQUENCE[self.step]
-        front = read_front_radar(self.r)
-        rear  = read_rear_radar(self.r)
+        front = await read_front_radar(self.r)
+        rear  = await read_rear_radar(self.r)
 
         front_blocked = (
             s["v"] > 0 and
@@ -314,37 +312,38 @@ class MazeMode:
 
         if obstacle_now and not self.obstacle_hold:
             self.obstacle_hold = True
-            publish_velocity(self.r, 0.0, s["w"])
+            await publish_velocity(self.r, 0.0, s["w"])
             direction = "front" if front_blocked else "rear"
             dist = front["dist"] if front_blocked else rear["dist"]
             self.mlog.warning("{} obstacle at {:.2f}m — legs paused", direction, dist)
-            self._publish_state("OBSTACLE_HOLD")
+            await self._publish_state("OBSTACLE_HOLD")
         elif not obstacle_now and self.obstacle_hold:
             self.obstacle_hold = False
-            publish_velocity(self.r, s["v"], s["w"])
+            await publish_velocity(self.r, s["v"], s["w"])
             self.mlog.info("Obstacle cleared — resuming")
 
         if not self.obstacle_hold:
             if time.time() - self.step_start >= s["duration"]:
                 self.step += 1
                 if self.step >= len(MAZE_SEQUENCE):
-                    publish_velocity(self.r, 0.0, 0.0)
-                    self._publish_state("COMPLETE")
+                    await publish_velocity(self.r, 0.0, 0.0)
+                    await self._publish_state("COMPLETE")
                     self.mlog.success("Sequence complete")
                     self.active = False
                     return
                 self.step_start = time.time()
-                self._dispatch_step()
+                await self._dispatch_step()
 
 
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run_controller():
-    r = Valkey(host='localhost', port=6379, decode_responses=True)
-    if not r.exists(KEY_MODE):
-        r.set(KEY_MODE, MODE_FOLLOW)
+async def run_controller():
+    r = avalkey.Valkey(host='localhost', port=6379, decode_responses=True)
+
+    if not await r.exists(KEY_MODE):
+        await r.set(KEY_MODE, MODE_FOLLOW)
 
     # Rear radar is optional
     rear_detector = None
@@ -383,40 +382,40 @@ def run_controller():
     try:
         while True:
             if rear_detector:
-                result   = rear_detector.get_next()
+                result = await asyncio.to_thread(rear_detector.get_next)
                 detected = result.presence_detected
                 raw_dist = result.presence_distance if detected else None
                 intra    = result.intra_presence_score
                 inter    = result.inter_presence_score
 
-                r.set(KEY_RADAR_REAR, json.dumps({
+                await r.set(KEY_RADAR_REAR, orjson.dumps({
                     "detected": detected,
                     "dist":     raw_dist,
                     "intra":    round(intra, 2),
                     "inter":    round(inter, 2),
                     "ts":       round(time.time(), 4),
-                }))
+                }).decode())
             else:
-                time.sleep(0.05)
+                await asyncio.sleep(0.05)
 
-            raw_mode = r.get(KEY_MODE)
+            raw_mode = await r.get(KEY_MODE)
             mode     = raw_mode if raw_mode in VALID_MODES else MODE_FOLLOW
 
             if mode != active_mode:
                 log.info("Mode: {} → {}", active_mode, mode)
-                if active_mode == MODE_FOLLOW: follow.reset()
-                elif active_mode == MODE_CROWD: crowd.reset()
-                elif active_mode == MODE_MAZE:  maze.reset()
+                if active_mode == MODE_FOLLOW: await follow.reset()
+                elif active_mode == MODE_CROWD: await crowd.reset()
+                elif active_mode == MODE_MAZE:  await maze.reset()
                 active_mode = mode
 
             if mode == MODE_FOLLOW:
-                follow.update()
+                await follow.update()
             elif mode == MODE_CROWD:
-                crowd.update()
+                await crowd.update()
             elif mode == MODE_MAZE:
-                maze.update()
+                await maze.update()
 
-    except KeyboardInterrupt:
+    except asyncio.CancelledError:
         pass
     finally:
         try:
@@ -426,9 +425,13 @@ def run_controller():
                 rear_client.close()
         except Exception:
             pass
-        publish_velocity(r, 0.0, 0.0)
+        await publish_velocity(r, 0.0, 0.0)
+        await r.aclose()
         log.info("Stopped")
 
 
 if __name__ == "__main__":
-    run_controller()
+    try:
+        asyncio.run(run_controller())
+    except KeyboardInterrupt:
+        pass

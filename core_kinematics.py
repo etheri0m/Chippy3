@@ -1,26 +1,20 @@
-import json
+import asyncio
 import time
-from valkey import Valkey
+import orjson
+import valkey.asyncio as avalkey
 from log_config import get_logger
 
 log = get_logger("Kinematics")
 
-# Minimum speed below which a motor is stopped rather than driven slowly.
-# Prevents motor whine and jitter at near-zero commands.
 DEADBAND = 0.05
 
-KEY_VELOCITY = 'chippy:cmd:velocity'   # INPUT  — receives {"v": float, "w": float}
-KEY_MOTORS   = 'chippy:cmd:motors'     # OUTPUT — sends to hardware node
-KEY_STATE    = 'chippy:state:kinematics'  # Published every cycle for GUI
+KEY_VELOCITY = 'chippy:cmd:velocity'
+KEY_MOTORS   = 'chippy:cmd:motors'
+KEY_STATE    = 'chippy:state:kinematics'
 
 
 def velocity_to_motor(value: float, target: str) -> dict:
-    """
-    Convert a signed velocity (-1.0 to 1.0) to a motor command dict.
-    Positive = forward, negative = backward, within deadband = stop.
-    """
     speed = abs(value)
-
     if speed < DEADBAND:
         return {"target": target, "dir": "stop", "speed": 0.0}
     elif value > 0:
@@ -29,43 +23,44 @@ def velocity_to_motor(value: float, target: str) -> dict:
         return {"target": target, "dir": "backward", "speed": round(speed, 3)}
 
 
-def run_kinematics():
-    r = Valkey(host='localhost', port=6379, decode_responses=True)
+async def run_kinematics():
+    r = avalkey.Valkey(host='localhost', port=6379, decode_responses=True)
     pubsub = r.pubsub()
-    pubsub.subscribe(KEY_VELOCITY)
+    await pubsub.subscribe(KEY_VELOCITY)
 
     log.info("Active — listening on chippy:cmd:velocity")
-    log.info('GUI/maze/manual: publish {{"v": float, "w": float}}')
 
-    for message in pubsub.listen():
-        if message['type'] != 'message':
-            continue
+    try:
+        async for message in pubsub.listen():
+            if message['type'] != 'message':
+                continue
 
-        try:
-            data = json.loads(message['data'])
+            try:
+                data = orjson.loads(message['data'])
 
-            # Clamp both axes to [-1.0, 1.0]
-            v = max(-1.0, min(1.0, float(data.get('v', 0.0))))
-            w = max(-1.0, min(1.0, float(data.get('w', 0.0))))
+                v = max(-1.0, min(1.0, float(data.get('v', 0.0))))
+                w = max(-1.0, min(1.0, float(data.get('w', 0.0))))
 
-            leg_cmd  = velocity_to_motor(v, "legs")
-            head_cmd = velocity_to_motor(w, "head")
+                leg_cmd  = velocity_to_motor(v, "legs")
+                head_cmd = velocity_to_motor(w, "head")
 
-            r.publish(KEY_MOTORS, json.dumps(leg_cmd))
-            r.publish(KEY_MOTORS, json.dumps(head_cmd))
+                await r.publish(KEY_MOTORS, orjson.dumps(leg_cmd).decode())
+                await r.publish(KEY_MOTORS, orjson.dumps(head_cmd).decode())
 
-            # Write current kinematic state for GUI to read
-            r.set(KEY_STATE, json.dumps({
-                "v":        v,
-                "w":        w,
-                "leg_dir":  leg_cmd["dir"],
-                "head_dir": head_cmd["dir"],
-                "ts":       round(time.time(), 4),
-            }))
+                await r.set(KEY_STATE, orjson.dumps({
+                    "v":        v,
+                    "w":        w,
+                    "leg_dir":  leg_cmd["dir"],
+                    "head_dir": head_cmd["dir"],
+                    "ts":       round(time.time(), 4),
+                }).decode())
 
-        except Exception as e:
-            log.error("Bad message: {}", e)
+            except Exception as e:
+                log.error("Bad message: {}", e)
+    finally:
+        await pubsub.unsubscribe()
+        await r.aclose()
 
 
 if __name__ == "__main__":
-    run_kinematics()
+    asyncio.run(run_kinematics())
