@@ -4,6 +4,9 @@ import multiprocessing
 from valkey import Valkey
 from acconeer.exptool import a121
 from acconeer.exptool.a121.algo.presence import Detector, DetectorConfig
+from log_config import get_logger
+
+log = get_logger("Radar")
 
 # Two separate physical radars, two separate serial IDs.
 # The rear radar (337) is exclusively owned by core_joystick.py.
@@ -14,6 +17,10 @@ KEY_FRONT = "chippy:state:radar:front"
 
 
 def radar_worker(port: str, state_key: str):
+    # Re-init logger inside subprocess (loguru state doesn't fork cleanly)
+    from log_config import get_logger as _get_logger
+    wlog = _get_logger("Radar")
+
     r = Valkey(host='localhost', port=6379, decode_responses=True)
     client = a121.Client.open(serial_port=port)
 
@@ -27,7 +34,7 @@ def radar_worker(port: str, state_key: str):
     detector = Detector(client=client, sensor_id=1, detector_config=config)
     detector.start()
 
-    print(f"[Radar] Worker started — key: {state_key}")
+    wlog.info("Worker started — key: {}", state_key)
 
     try:
         while True:
@@ -47,7 +54,7 @@ def radar_worker(port: str, state_key: str):
     finally:
         detector.stop()
         client.close()
-        print(f"[Radar] Worker stopped — {state_key}")
+        wlog.info("Worker stopped — {}", state_key)
 
 
 if __name__ == "__main__":
@@ -57,10 +64,10 @@ if __name__ == "__main__":
         daemon=True,
     )
     front.start()
-    print("[Radar] Front radar process started.")
+    log.info("Front radar process started")
 
     try:
         front.join()
     except KeyboardInterrupt:
         front.terminate()
-        print("[Radar] Shutdown.")
+        log.info("Shutdown")

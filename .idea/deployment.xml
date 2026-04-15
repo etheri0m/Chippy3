@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="alaabasha@192.168.100.109:22 password" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="alaabasha@192.168.178.102:22 password" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
       <paths name="alaabasha@172.20.10.2:22 password">
@@ -24,6 +24,16 @@
         </serverdata>
       </paths>
       <paths name="alaabasha@192.168.178.100:22 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/alaabasha/chippy3" local="$PROJECT_DIR$" />
+          </mappings>
+          <excludedPaths>
+            <excludedPath path="/home/alaabasha/chippy3/.venv" />
+          </excludedPaths>
+        </serverdata>
+      </paths>
+      <paths name="alaabasha@192.168.178.102:22 password">
         <serverdata>
           <mappings>
             <mapping deploy="/home/alaabasha/chippy3" local="$PROJECT_DIR$" />

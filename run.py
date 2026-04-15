@@ -3,6 +3,9 @@ import sys
 import time
 import os
 import signal
+from log_config import get_logger
+
+log = get_logger("Run")
 
 # Set SKIP_HARDWARE=1 to run without core_hardware.py (no motors)
 SKIP_HARDWARE = os.environ.get("SKIP_HARDWARE", "0") == "1"
@@ -22,10 +25,10 @@ SCRIPTS += [
 processes = []
 
 def shutdown(sig=None, frame=None):
-    print("\n[Run] Shutting down all processes...")
+    log.info("Shutting down all processes...")
     for name, proc in processes:
         proc.terminate()
-        print(f"[Run] Stopped {name}")
+        log.info("Stopped {}", name)
     sys.exit(0)
 
 signal.signal(signal.SIGINT, shutdown)
@@ -40,25 +43,25 @@ for name, script in SCRIPTS:
         stderr=sys.stderr,
     )
     processes.append((name, proc))
-    print(f"[Run] Started {name} (pid {proc.pid})")
+    log.info("Started {} (pid {})", name, proc.pid)
 
     # Hardware needs time to calibrate before anything else starts
     if name == "Hardware":
-        print("[Run] Waiting 12s for hardware calibration...")
+        log.info("Waiting 12s for hardware calibration...")
         time.sleep(12)
     else:
         time.sleep(1)
 
 if SKIP_HARDWARE:
-    print("[Run] Hardware SKIPPED (no motors).")
+    log.warning("Hardware SKIPPED (no motors)")
 
-print("\n[Run] All systems up. Ctrl+C to stop everything.\n")
+log.success("All systems up. Ctrl+C to stop everything.")
 
 # Watch for any process dying unexpectedly
 while True:
     for i, (name, proc) in enumerate(processes):
         if proc.poll() is not None:
-            print(f"[Run] WARNING: {name} died (exit {proc.returncode}) — restarting...")
+            log.warning("{} died (exit {}) — restarting...", name, proc.returncode)
             path = os.path.join(os.path.dirname(__file__),
                                 next(s for n, s in SCRIPTS if n == name))
             new_proc = subprocess.Popen(

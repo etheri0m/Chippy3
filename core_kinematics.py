@@ -1,6 +1,9 @@
 import json
 import time
 from valkey import Valkey
+from log_config import get_logger
+
+log = get_logger("Kinematics")
 
 # Minimum speed below which a motor is stopped rather than driven slowly.
 # Prevents motor whine and jitter at near-zero commands.
@@ -31,8 +34,8 @@ def run_kinematics():
     pubsub = r.pubsub()
     pubsub.subscribe(KEY_VELOCITY)
 
-    print("[Kinematics] Active — listening on chippy:cmd:velocity")
-    print("[Kinematics] GUI/maze/manual: publish {\"v\": float, \"w\": float}")
+    log.info("Active — listening on chippy:cmd:velocity")
+    log.info('GUI/maze/manual: publish {{"v": float, "w": float}}')
 
     for message in pubsub.listen():
         if message['type'] != 'message':
@@ -61,7 +64,7 @@ def run_kinematics():
             }))
 
         except Exception as e:
-            print(f"[Kinematics] Bad message: {e}")
+            log.error("Bad message: {}", e)
 
 
 if __name__ == "__main__":

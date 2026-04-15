@@ -12,6 +12,9 @@ import math
 import random
 import time
 from nicegui import ui
+from log_config import get_logger
+
+log = get_logger("Dashboard")
 
 # ── Valkey keys ──────────────────────────────────────────────────────────────
 KEYS = {
@@ -35,10 +38,10 @@ try:
     from valkey import Valkey
     vk = Valkey(host="localhost", port=6379, decode_responses=True)
     vk.ping()
-    print("[Dashboard] Connected to Valkey.")
+    log.info("Connected to Valkey")
 except Exception:
     DEMO_MODE = True
-    print("[Dashboard] Valkey unavailable — running in DEMO mode with fake data.")
+    log.warning("Valkey unavailable — running in DEMO mode with fake data")
 
 
 # ── Demo state (used when Valkey is not available) ───────────────────────────
@@ -136,8 +139,10 @@ def publish_velocity(v: float, w: float):
 def set_mode(mode: str):
     if DEMO_MODE:
         _demo_state["mode"] = mode
+        log.info("Demo mode set to {}", mode)
         return
     vk.set(KEYS["mode"], mode)
+    log.info("Mode set to {}", mode)
 
 
 def fmt(v, dp=2) -> str:
@@ -481,6 +486,7 @@ def dashboard():
         except Exception as e:
             conn_dot.style("font-size:10px; color:#ff4a6b;")
             conn_text.text = f"error: {e}"
+            log.error("Poll error: {}", e)
 
     ui.timer(POLL_INTERVAL, poll)
 

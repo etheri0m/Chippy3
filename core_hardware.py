@@ -2,7 +2,9 @@ import time
 import json
 import pigpio
 import valkey
+from log_config import get_logger
 
+log = get_logger("Hardware")
 
 # hardware_PWM duty cycle is 0–1,000,000 (millionths, not 0–255)
 # GPIO 12 = PWM channel 0,  GPIO 13 = PWM channel 1  (separate channels, no conflict)
@@ -54,7 +56,7 @@ class HardwareNode:
 
         # Wake the driver
         self.pi.write(self.STBY_PIN, 1)
-        print("[Hardware] TB6612FNG awake (STBY HIGH).")
+        log.info("TB6612FNG awake (STBY HIGH)")
 
     # -------------------------------------------------------------------------
 
@@ -69,7 +71,7 @@ class HardwareNode:
             # "home" is a logical command from the joystick — physically it's the head motor
             pwm_pin, in1_pin, in2_pin = self.HEAD_PWM, self.HEAD_IN1, self.HEAD_IN2
         else:
-            print(f"[Hardware] Unknown motor target: '{target}' — ignored.")
+            log.warning("Unknown motor target: '{}' — ignored", target)
             return
 
         if direction == "stop" or speed <= 0.0:
@@ -86,7 +88,7 @@ class HardwareNode:
             self.pi.write(in1_pin, 0)
             self.pi.write(in2_pin, 1)
         else:
-            print(f"[Hardware] Unknown direction: '{direction}' — ignored.")
+            log.warning("Unknown direction: '{}' — ignored", direction)
             return
 
         self.pi.hardware_PWM(pwm_pin, PWM_FREQ, self._pwm_duty(speed))
@@ -99,26 +101,26 @@ class HardwareNode:
         Each motor pulses forward for 0.3s then stops.
         If you see no movement here the problem is hardware (wiring/power), not code.
         """
-        print("[Hardware] Self-test: pulsing LEG motor...")
+        log.info("Self-test: pulsing LEG motor...")
         self.set_motor("legs", "forward", 0.6)
         time.sleep(0.3)
         self.set_motor("legs", "stop", 0.0)
         time.sleep(0.3)
 
-        print("[Hardware] Self-test: pulsing HEAD motor...")
+        log.info("Self-test: pulsing HEAD motor...")
         self.set_motor("head", "forward", 0.6)
         time.sleep(0.3)
         self.set_motor("head", "stop", 0.0)
         time.sleep(0.3)
 
-        print("[Hardware] Self-test complete.")
+        log.info("Self-test complete")
 
     def calibrate_head(self):
-        print("[Hardware] Starting head calibration...")
+        log.info("Starting head calibration...")
 
         # If already on the magnet, back off first
         if self.pi.read(self.HALL_PIN) == 0:
-            print("[Hardware] Head on magnet — backing off...")
+            log.info("Head on magnet — backing off...")
             self.set_motor("head", "backward", 0.8)
             timeout = time.time() + 5.0
             while self.pi.read(self.HALL_PIN) == 0 and time.time() < timeout:
@@ -128,14 +130,14 @@ class HardwareNode:
             time.sleep(0.5)
 
         # Sweep forward to find the magnet
-        print("[Hardware] Sweeping forward to find centre...")
+        log.info("Sweeping forward to find centre...")
         self.set_motor("head", "forward", 0.8)
 
         timeout = time.time() + 10.0
         while time.time() < timeout:
             if self.pi.read(self.HALL_PIN) == 0:
                 self.set_motor("head", "stop", 0.0)
-                print("[Hardware] Head centred on magnet.")
+                log.success("Head centred on magnet")
                 self.vk.set("chippy:state:head", json.dumps({"calibrated": True, "position": 0}))
                 return
             time.sleep(0.01)
@@ -143,7 +145,7 @@ class HardwareNode:
         # Timeout — stop and flag it so the joystick knows not to trust position
         self.set_motor("head", "stop", 0.0)
         self.vk.set("chippy:state:head", json.dumps({"calibrated": False, "position": None}))
-        print("[Hardware] WARNING: Calibration timeout — magnet not found. Check wiring.")
+        log.warning("Calibration timeout — magnet not found. Check wiring.")
 
     # -------------------------------------------------------------------------
 
@@ -152,7 +154,7 @@ class HardwareNode:
         self.calibrate_head()
 
         self.pubsub.subscribe("chippy:cmd:motors")
-        print("[Hardware] Listening on chippy:cmd:motors ...")
+        log.info("Listening on chippy:cmd:motors")
 
         for message in self.pubsub.listen():
             if message['type'] != 'message':
@@ -160,9 +162,9 @@ class HardwareNode:
             try:
                 cmd = json.loads(message['data'])
                 self.set_motor(cmd['target'], cmd['dir'], cmd['speed'])
-                print(f"[Hardware] {cmd['target']:5} | {cmd['dir']:8} | spd {cmd['speed']:.2f}")
+                log.debug("{:5} | {:8} | spd {:.2f}", cmd['target'], cmd['dir'], cmd['speed'])
             except Exception as e:
-                print(f"[Hardware] Bad command: {e} — raw: {message['data']}")
+                log.error("Bad command: {} — raw: {}", e, message['data'])
 
 
 # -------------------------------------------------------------------------
@@ -183,4 +185,4 @@ if __name__ == "__main__":
         node.pi.write(node.HEAD_IN1, 0)
         node.pi.write(node.HEAD_IN2, 0)
         node.pi.stop()
-        print("\n[Hardware] Shutdown complete. Driver asleep.")
+        log.info("Shutdown complete. Driver asleep.")
