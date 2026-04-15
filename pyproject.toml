@@ -1,12 +1,17 @@
 [project]
-name = "chippy3"
-version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.14"
+name = "chippypi"
+version = "3.0.0"
+description = "KOSMOS Chipz hexapod robot — custom controller"
+requires-python = ">=3.11"
 dependencies = [
-    "acconeer-exptool>=7.17.2",
-    "pigpio>=1.78",
-    "scipy>=1.17.1",
-    "valkey>=6.1.1",
+    "pigpio",
+    "valkey[libvalkey]",
+    "acconeer-exptool[a121]",
+    "nicegui",
+    "loguru",
+    "orjson",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

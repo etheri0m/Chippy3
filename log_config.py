@@ -1,16 +1,15 @@
 """
 Shared logging configuration for all ChippyPi scripts.
-Import: from log_config import logger
+Import: from log_config import get_logger
 """
 
 import sys
 from loguru import logger
 
-# Remove default handler (stdout with DEBUG level)
+# Remove default handler
 logger.remove()
 
 # Console: coloured, concise format
-# DEBUG and above — change to "INFO" in production to silence per-frame noise
 logger.add(
     sys.stderr,
     level="DEBUG",

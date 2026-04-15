@@ -1,22 +1,102 @@
 """
-ChippyPi — NiceGUI Dashboard
-Run:   python3 main.py
+ChippyPi — Entry point
+Launches all core scripts as subprocesses, then starts the NiceGUI dashboard.
+Run:   uv run main.py              (full system)
+Run:   SKIP_HARDWARE=1 uv run main.py  (without motors)
 Open:  http://<pi-ip>:8080
-
-Reads all Valkey state keys, displays live data, allows mode switching.
-No motors or radar — purely a display/control layer.
 """
 
-import json
+import asyncio
 import math
+import os
 import random
+import sys
 import time
-from nicegui import ui
+import orjson
+from nicegui import app, ui
 from log_config import get_logger
 
-log = get_logger("Dashboard")
+log = get_logger("Main")
+
+# ── Subprocess launcher ──────────────────────────────────────────────────────
+
+SKIP_HARDWARE = os.environ.get("SKIP_HARDWARE", "0") == "1"
+
+SCRIPTS = []
+if not SKIP_HARDWARE:
+    SCRIPTS.append(("Hardware",   "core_hardware.py"))
+SCRIPTS += [
+    ("Radar",      "core_radar.py"),
+    ("Kinematics", "core_kinematics.py"),
+    ("Controller", "core_joystick.py"),
+]
+
+_processes: list[tuple[str, asyncio.subprocess.Process]] = []
+
+
+async def _launch(name: str, script: str) -> asyncio.subprocess.Process:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), script)
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, path,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+    )
+    log.info("Started {} (pid {})", name, proc.pid)
+    return proc
+
+
+async def _watchdog():
+    """Restart any crashed subprocess."""
+    while True:
+        for i, (name, proc) in enumerate(_processes):
+            if proc.returncode is not None:
+                log.warning("{} died (exit {}) — restarting...", name, proc.returncode)
+                script = next(s for n, s in SCRIPTS if n == name)
+                new_proc = await _launch(name, script)
+                _processes[i] = (name, new_proc)
+        await asyncio.sleep(2)
+
+
+async def startup():
+    """Called by NiceGUI on server start — launch core scripts."""
+    for name, script in SCRIPTS:
+        proc = await _launch(name, script)
+        _processes.append((name, proc))
+
+        if name == "Hardware":
+            log.info("Waiting 12s for hardware calibration...")
+            await asyncio.sleep(12)
+        else:
+            await asyncio.sleep(1)
+
+    if SKIP_HARDWARE:
+        log.warning("Hardware SKIPPED (no motors)")
+
+    log.success("All systems up")
+
+    # Start watchdog as background task
+    asyncio.create_task(_watchdog())
+
+
+async def shutdown():
+    """Called by NiceGUI on server stop — terminate core scripts."""
+    log.info("Shutting down all processes...")
+    for name, proc in _processes:
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+            log.info("Stopped {}", name)
+
+
+app.on_startup(startup)
+app.on_shutdown(shutdown)
+
 
 # ── Valkey keys ──────────────────────────────────────────────────────────────
+
 KEYS = {
     "mode":        "chippy:mode",
     "head":        "chippy:state:head",
@@ -28,34 +108,36 @@ KEYS = {
 }
 
 VALID_MODES = ["FOLLOW", "CROWD", "MAZE"]
-POLL_INTERVAL = 0.2  # seconds
+POLL_INTERVAL = 0.2
 
 # ── Try Valkey, fall back to demo mode ───────────────────────────────────────
+
 DEMO_MODE = False
 vk = None
 
 try:
-    from valkey import Valkey
-    vk = Valkey(host="localhost", port=6379, decode_responses=True)
-    vk.ping()
+    import valkey.asyncio as avalkey
+    import valkey as sync_valkey
+    _test = sync_valkey.Valkey(host="localhost", port=6379, decode_responses=True)
+    _test.ping()
+    _test.close()
+    del _test
+    vk = avalkey.Valkey(host="localhost", port=6379, decode_responses=True)
     log.info("Connected to Valkey")
 except Exception:
     DEMO_MODE = True
     log.warning("Valkey unavailable — running in DEMO mode with fake data")
 
 
-# ── Demo state (used when Valkey is not available) ───────────────────────────
-_demo_state = {
-    "mode": "FOLLOW",
-}
+# ── Demo state ───────────────────────────────────────────────────────────────
+
+_demo_state = {"mode": "FOLLOW"}
 
 
 def _demo_data() -> dict:
-    """Generate fake but realistic-looking sensor data for UI work."""
     t = time.time()
     mode = _demo_state["mode"]
 
-    # Simulate some wobble
     intra_f = abs(math.sin(t * 0.7)) * 8.0 + random.uniform(0, 2)
     inter_f = abs(math.cos(t * 0.4)) * 6.0 + random.uniform(0, 1.5)
     intra_j = abs(math.sin(t * 1.1)) * 10.0 + random.uniform(0, 1)
@@ -66,7 +148,6 @@ def _demo_data() -> dict:
     det_f = intra_f > 4.0
     det_j = intra_j > 5.0
 
-    # Crowd classification
     avg_inter = inter_f
     if avg_inter >= 8.0:
         density = "BUSY"
@@ -75,7 +156,6 @@ def _demo_data() -> dict:
     else:
         density = "EMPTY"
 
-    # Leg direction based on rear radar distance
     if det_j and dist_j < 0.20:
         leg_dir, v = "backward", -0.7
     elif det_j and dist_j > 0.30:
@@ -85,7 +165,6 @@ def _demo_data() -> dict:
 
     head_dir = "forward" if det_f else "stop"
     w = 0.5 if det_f else 0.0
-
     maze_step = int((t % 12) / 2) + 1
 
     return {
@@ -118,30 +197,30 @@ def _demo_data() -> dict:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def vk_get(key: str) -> dict | None:
+async def vk_get(key: str) -> dict | None:
     if DEMO_MODE:
-        return None  # handled by _demo_data() in poll
-    raw = vk.get(key)
+        return None
+    raw = await vk.get(key)
     if raw:
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
+            return orjson.loads(raw)
+        except Exception:
             pass
     return None
 
 
-def publish_velocity(v: float, w: float):
+async def publish_velocity(v: float, w: float):
     if DEMO_MODE:
         return
-    vk.publish("chippy:cmd:velocity", json.dumps({"v": v, "w": w}))
+    await vk.publish("chippy:cmd:velocity", orjson.dumps({"v": v, "w": w}).decode())
 
 
-def set_mode(mode: str):
+async def set_mode(mode: str):
     if DEMO_MODE:
         _demo_state["mode"] = mode
         log.info("Demo mode set to {}", mode)
         return
-    vk.set(KEYS["mode"], mode)
+    await vk.set(KEYS["mode"], mode)
     log.info("Mode set to {}", mode)
 
 
@@ -177,7 +256,6 @@ DENSITY_COLORS = {
 @ui.page("/")
 def dashboard():
 
-    # -- dark theme & custom style --
     ui.dark_mode().enable()
     ui.add_head_html("""
     <style>
@@ -204,7 +282,6 @@ def dashboard():
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
     """)
 
-    # ── Header ──
     with ui.row().classes("w-full items-center justify-between pb-4"):
         ui.label("CHIPPYPI").style(
             "font-size:22px; font-weight:700; letter-spacing:3px; color:#00d4aa;"
@@ -215,7 +292,6 @@ def dashboard():
 
     ui.separator().style("background:#2a2a30;")
 
-    # ── Grid ──
     with ui.grid(columns=3).classes("w-full gap-4 mt-4").style(
         "grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));"
     ):
@@ -294,7 +370,7 @@ def dashboard():
             ).props("color='amber'")
             front_inter_val = ui.label("0").style("font-size:11px; font-weight:600;")
 
-        # ── JOYSTICK RADAR ──
+        # ── REAR RADAR ──
         with ui.card().classes("p-4"):
             ui.label("Rear Radar").classes("card-title")
             with ui.column().classes("gap-1"):
@@ -374,7 +450,7 @@ def dashboard():
 
     # ── Poll loop ────────────────────────────────────────────────────────────
 
-    def poll():
+    async def poll():
         try:
             if DEMO_MODE:
                 d = _demo_data()
@@ -386,15 +462,14 @@ def dashboard():
                 cr   = d["crowd"]
                 mz   = d["maze"]
             else:
-                mode = vk.get(KEYS["mode"]) or "—"
-                head = vk_get(KEYS["head"])
-                kin  = vk_get(KEYS["kinematics"])
-                rf   = vk_get(KEYS["radar_front"])
-                rj   = vk_get(KEYS["radar_rear"])
-                cr   = vk_get(KEYS["crowd"])
-                mz   = vk_get(KEYS["maze"])
+                mode = await vk.get(KEYS["mode"]) or "—"
+                head = await vk_get(KEYS["head"])
+                kin  = await vk_get(KEYS["kinematics"])
+                rf   = await vk_get(KEYS["radar_front"])
+                rj   = await vk_get(KEYS["radar_rear"])
+                cr   = await vk_get(KEYS["crowd"])
+                mz   = await vk_get(KEYS["maze"])
 
-            # Mode
             mode_label.text = mode
             for m, btn in mode_btns.items():
                 if m == mode:
@@ -410,7 +485,6 @@ def dashboard():
                         "color:#6b6b76; background:transparent !important;"
                     )
 
-            # Head
             if head:
                 cal = head.get("calibrated", False)
                 head_cal.text = "YES" if cal else "NO"
@@ -418,7 +492,6 @@ def dashboard():
                 pos = head.get("position")
                 head_pos.text = str(pos) if pos is not None else "—"
 
-            # Kinematics
             if kin:
                 kin_v.text = fmt(kin.get("v"), 3)
                 kin_w.text = fmt(kin.get("w"), 3)
@@ -429,7 +502,6 @@ def dashboard():
                 leg_icon.text = dir_arrow(ld)
                 head_icon.text = dir_arrow(hd)
 
-            # Front radar
             if rf:
                 front_det.text = "YES" if rf.get("detected") else "no"
                 d = rf.get("dist")
@@ -439,7 +511,6 @@ def dashboard():
                 front_inter_bar.value = bar_pct(rf.get("inter", 0))
                 front_inter_val.text = fmt(rf.get("inter", 0), 1)
 
-            # Rear radar
             if rj:
                 rear_det.text = "YES" if rj.get("detected") else "no"
                 d = rj.get("dist")
@@ -449,7 +520,6 @@ def dashboard():
                 rear_inter_bar.value = bar_pct(rj.get("inter", 0))
                 rear_inter_val.text = fmt(rj.get("inter", 0), 1)
 
-            # Crowd
             if cr:
                 density = cr.get("density", "—")
                 color = DENSITY_COLORS.get(density, "#6b6b76")
@@ -466,7 +536,6 @@ def dashboard():
                 d = cr.get("dist")
                 crowd_dist.text = f"{fmt(d, 3)} m" if d is not None else "—"
 
-            # Maze
             if mz:
                 maze_status.text = mz.get("status", "—")
                 step = mz.get("step", 0)
@@ -475,7 +544,6 @@ def dashboard():
                 maze_obstacle.text = "BLOCKED" if mz.get("obstacle") else "clear"
                 maze_bar.value = (step / total) if total > 0 else 0
 
-            # Connection indicator
             if DEMO_MODE:
                 conn_dot.style("font-size:10px; color:#ffc44a;")
                 conn_text.text = "demo"

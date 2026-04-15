@@ -1,0 +1,35 @@
+services:
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey-data:/data
+
+  chippy:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - valkey
+    ports:
+      - "8080:8080"
+    environment:
+      - SKIP_HARDWARE=${SKIP_HARDWARE:-0}
+      # pigpiod runs on the HOST — tell pigpio client to connect there
+      - PIGPIO_ADDR=host.docker.internal
+    # USB serial devices for radars — pass through to container
+    devices:
+      - /dev/serial/by-id:/dev/serial/by-id
+    # Needed for serial port access
+    privileged: false
+    group_add:
+      - dialout
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - /tmp:/tmp  # shared log directory
+
+volumes:
+  valkey-data:

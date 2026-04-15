@@ -1,14 +1,14 @@
-import time
-import json
+import asyncio
 import pigpio
-import valkey
+import orjson
+import valkey.asyncio as avalkey
 from log_config import get_logger
 
 log = get_logger("Hardware")
 
-# hardware_PWM duty cycle is 0–1,000,000 (millionths, not 0–255)
-# GPIO 12 = PWM channel 0,  GPIO 13 = PWM channel 1  (separate channels, no conflict)
-PWM_FREQ = 1000   # Hz — good for toy DC motors. Lower = more torque at low speeds.
+# PWM frequency for IN1/IN2 software PWM (pigpio set_PWM_dutycycle)
+# Duty cycle range: 0–255 (pigpio default)
+PWM_FREQ = 1000
 
 
 class HardwareNode:
@@ -17,38 +17,32 @@ class HardwareNode:
         if not self.pi.connected:
             raise RuntimeError("pigpiod is not running. Run: sudo systemctl start pigpiod")
 
-        self.vk = valkey.Valkey(host='localhost', port=6379, decode_responses=True)
-        self.pubsub = self.vk.pubsub()
-
         # --- TB6612FNG PIN MAPPING ---
+        # PWMA/PWMB are wired to 3.3V (permanently HIGH).
+        # Speed control via PWM on IN1/IN2 pins instead.
         self.STBY_PIN = 21
 
-        self.LEG_PWM  = 12   # hardware PWM channel 0
+        # Legs motor (channel A) — PWM on IN pins
         self.LEG_IN1  = 16
         self.LEG_IN2  = 20
 
-        self.HEAD_PWM = 13   # hardware PWM channel 1
+        # Head motor (channel B) — PWM on IN pins
         self.HEAD_IN1 = 19
         self.HEAD_IN2 = 26
 
         self.HALL_PIN = 17
         # -----------------------------
 
-        # Direction/logic pins — safe to set as plain outputs
-        dir_pins = [
-            self.STBY_PIN,
-            self.LEG_IN1, self.LEG_IN2,
-            self.HEAD_IN1, self.HEAD_IN2,
-        ]
-        for pin in dir_pins:
-            self.pi.set_mode(pin, pigpio.OUTPUT)
-            self.pi.write(pin, 0)
+        # STBY as plain output
+        self.pi.set_mode(self.STBY_PIN, pigpio.OUTPUT)
+        self.pi.write(self.STBY_PIN, 0)
 
-        # PWM pins — initialise via hardware_PWM (do NOT pre-set as OUTPUT).
-        # GPIO 12/13 are hardware PWM pins. Using set_PWM_dutycycle (DMA) on
-        # these conflicts with the Pi audio subsystem and produces no output.
-        self.pi.hardware_PWM(self.LEG_PWM,  PWM_FREQ, 0)
-        self.pi.hardware_PWM(self.HEAD_PWM, PWM_FREQ, 0)
+        # IN pins: set PWM frequency and initialise duty to 0
+        in_pins = [self.LEG_IN1, self.LEG_IN2, self.HEAD_IN1, self.HEAD_IN2]
+        for pin in in_pins:
+            self.pi.set_mode(pin, pigpio.OUTPUT)
+            self.pi.set_PWM_frequency(pin, PWM_FREQ)
+            self.pi.set_PWM_dutycycle(pin, 0)
 
         # Hall effect sensor
         self.pi.set_mode(self.HALL_PIN, pigpio.INPUT)
@@ -56,133 +50,123 @@ class HardwareNode:
 
         # Wake the driver
         self.pi.write(self.STBY_PIN, 1)
-        log.info("TB6612FNG awake (STBY HIGH)")
+        log.info("TB6612FNG awake (STBY HIGH) — PWM on IN1/IN2")
 
-    # -------------------------------------------------------------------------
-
-    def _pwm_duty(self, speed: float) -> int:
-        """Convert 0.0–1.0 speed to hardware_PWM duty (0–1,000,000)."""
-        return int(max(0.0, min(speed, 1.0)) * 1_000_000)
+    def _duty(self, speed: float) -> int:
+        """Convert 0.0–1.0 speed to pigpio duty (0–255)."""
+        return int(max(0.0, min(speed, 1.0)) * 255)
 
     def set_motor(self, target: str, direction: str, speed: float):
         if target == "legs":
-            pwm_pin, in1_pin, in2_pin = self.LEG_PWM,  self.LEG_IN1,  self.LEG_IN2
+            in1_pin, in2_pin = self.LEG_IN1, self.LEG_IN2
         elif target in ("head", "home"):
-            # "home" is a logical command from the joystick — physically it's the head motor
-            pwm_pin, in1_pin, in2_pin = self.HEAD_PWM, self.HEAD_IN1, self.HEAD_IN2
+            in1_pin, in2_pin = self.HEAD_IN1, self.HEAD_IN2
         else:
             log.warning("Unknown motor target: '{}' — ignored", target)
             return
 
-        if direction == "stop" or speed <= 0.0:
-            # Coast: IN1=0, IN2=0, PWM=0
-            self.pi.write(in1_pin, 0)
-            self.pi.write(in2_pin, 0)
-            self.pi.hardware_PWM(pwm_pin, PWM_FREQ, 0)
-            return
+        duty = self._duty(speed)
 
-        if direction == "forward":
-            self.pi.write(in1_pin, 1)
-            self.pi.write(in2_pin, 0)
+        if direction == "stop" or speed <= 0.0:
+            self.pi.set_PWM_dutycycle(in1_pin, 0)
+            self.pi.set_PWM_dutycycle(in2_pin, 0)
+        elif direction == "forward":
+            self.pi.set_PWM_dutycycle(in1_pin, duty)
+            self.pi.set_PWM_dutycycle(in2_pin, 0)
         elif direction == "backward":
-            self.pi.write(in1_pin, 0)
-            self.pi.write(in2_pin, 1)
+            self.pi.set_PWM_dutycycle(in1_pin, 0)
+            self.pi.set_PWM_dutycycle(in2_pin, duty)
         else:
             log.warning("Unknown direction: '{}' — ignored", direction)
             return
 
-        self.pi.hardware_PWM(pwm_pin, PWM_FREQ, self._pwm_duty(speed))
-
-    # -------------------------------------------------------------------------
-
-    def self_test(self):
-        """
-        Brief motor pulse on startup to confirm wiring before calibration.
-        Each motor pulses forward for 0.3s then stops.
-        If you see no movement here the problem is hardware (wiring/power), not code.
-        """
+    async def self_test(self):
         log.info("Self-test: pulsing LEG motor...")
         self.set_motor("legs", "forward", 0.6)
-        time.sleep(0.3)
+        await asyncio.sleep(0.3)
         self.set_motor("legs", "stop", 0.0)
-        time.sleep(0.3)
+        await asyncio.sleep(0.3)
 
         log.info("Self-test: pulsing HEAD motor...")
         self.set_motor("head", "forward", 0.6)
-        time.sleep(0.3)
+        await asyncio.sleep(0.3)
         self.set_motor("head", "stop", 0.0)
-        time.sleep(0.3)
+        await asyncio.sleep(0.3)
 
         log.info("Self-test complete")
 
-    def calibrate_head(self):
+    async def calibrate_head(self):
+        vk = avalkey.Valkey(host='localhost', port=6379, decode_responses=True)
         log.info("Starting head calibration...")
 
-        # If already on the magnet, back off first
         if self.pi.read(self.HALL_PIN) == 0:
             log.info("Head on magnet — backing off...")
             self.set_motor("head", "backward", 0.8)
-            timeout = time.time() + 5.0
-            while self.pi.read(self.HALL_PIN) == 0 and time.time() < timeout:
-                time.sleep(0.01)
-            time.sleep(0.2)
+            deadline = asyncio.get_event_loop().time() + 5.0
+            while self.pi.read(self.HALL_PIN) == 0 and asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.2)
             self.set_motor("head", "stop", 0.0)
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
 
-        # Sweep forward to find the magnet
         log.info("Sweeping forward to find centre...")
         self.set_motor("head", "forward", 0.8)
 
-        timeout = time.time() + 10.0
-        while time.time() < timeout:
+        deadline = asyncio.get_event_loop().time() + 10.0
+        while asyncio.get_event_loop().time() < deadline:
             if self.pi.read(self.HALL_PIN) == 0:
                 self.set_motor("head", "stop", 0.0)
                 log.success("Head centred on magnet")
-                self.vk.set("chippy:state:head", json.dumps({"calibrated": True, "position": 0}))
+                await vk.set("chippy:state:head",
+                             orjson.dumps({"calibrated": True, "position": 0}).decode())
+                await vk.aclose()
                 return
-            time.sleep(0.01)
+            await asyncio.sleep(0.01)
 
-        # Timeout — stop and flag it so the joystick knows not to trust position
         self.set_motor("head", "stop", 0.0)
-        self.vk.set("chippy:state:head", json.dumps({"calibrated": False, "position": None}))
+        await vk.set("chippy:state:head",
+                      orjson.dumps({"calibrated": False, "position": None}).decode())
+        await vk.aclose()
         log.warning("Calibration timeout — magnet not found. Check wiring.")
 
-    # -------------------------------------------------------------------------
+    async def run(self):
+        await self.self_test()
+        await self.calibrate_head()
 
-    def run(self):
-        self.self_test()
-        self.calibrate_head()
-
-        self.pubsub.subscribe("chippy:cmd:motors")
+        vk = avalkey.Valkey(host='localhost', port=6379, decode_responses=True)
+        pubsub = vk.pubsub()
+        await pubsub.subscribe("chippy:cmd:motors")
         log.info("Listening on chippy:cmd:motors")
 
-        for message in self.pubsub.listen():
-            if message['type'] != 'message':
-                continue
-            try:
-                cmd = json.loads(message['data'])
-                self.set_motor(cmd['target'], cmd['dir'], cmd['speed'])
-                log.debug("{:5} | {:8} | spd {:.2f}", cmd['target'], cmd['dir'], cmd['speed'])
-            except Exception as e:
-                log.error("Bad command: {} — raw: {}", e, message['data'])
+        try:
+            async for message in pubsub.listen():
+                if message['type'] != 'message':
+                    continue
+                try:
+                    cmd = orjson.loads(message['data'])
+                    self.set_motor(cmd['target'], cmd['dir'], cmd['speed'])
+                    log.debug("{:5} | {:8} | spd {:.2f}", cmd['target'], cmd['dir'], cmd['speed'])
+                except Exception as e:
+                    log.error("Bad command: {} — raw: {}", e, message['data'])
+        finally:
+            await pubsub.unsubscribe()
+            await vk.aclose()
 
+    def shutdown(self):
+        self.pi.set_PWM_dutycycle(self.LEG_IN1,  0)
+        self.pi.set_PWM_dutycycle(self.LEG_IN2,  0)
+        self.pi.set_PWM_dutycycle(self.HEAD_IN1, 0)
+        self.pi.set_PWM_dutycycle(self.HEAD_IN2, 0)
+        self.pi.write(self.STBY_PIN, 0)
+        self.pi.stop()
+        log.info("Shutdown complete. Driver asleep.")
 
-# -------------------------------------------------------------------------
 
 if __name__ == "__main__":
     node = HardwareNode()
     try:
-        node.run()
+        asyncio.run(node.run())
     except KeyboardInterrupt:
         pass
     finally:
-        # Safe shutdown: brake off, driver asleep
-        node.pi.write(node.STBY_PIN, 0)
-        node.pi.hardware_PWM(node.LEG_PWM,  PWM_FREQ, 0)
-        node.pi.hardware_PWM(node.HEAD_PWM, PWM_FREQ, 0)
-        node.pi.write(node.LEG_IN1,  0)
-        node.pi.write(node.LEG_IN2,  0)
-        node.pi.write(node.HEAD_IN1, 0)
-        node.pi.write(node.HEAD_IN2, 0)
-        node.pi.stop()
-        log.info("Shutdown complete. Driver asleep.")
+        node.shutdown()
