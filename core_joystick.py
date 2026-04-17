@@ -23,9 +23,11 @@ SWEEP_DURATION = 0.8
 SWEEP_TIMEOUT  = 3.0
 
 # --- CROWD mode ---
-CROWD_WINDOW_FRAMES  = 40
-CROWD_HIGH_THRESHOLD = 8.0
-CROWD_LOW_THRESHOLD  = 3.0
+CROWD_WINDOW_FRAMES      = 40
+CROWD_HIGH_THRESHOLD     = 8.0
+CROWD_LOW_THRESHOLD      = 3.0
+CROWD_HEAD_SWEEP_SPEED    = 0.5   # gentle pan — looks natural
+CROWD_HEAD_SWEEP_DURATION = 1.2   # seconds per direction
 
 # --- MAZE mode ---
 MAZE_FRONT_OBSTACLE_DIST = 0.35
@@ -201,11 +203,21 @@ class CrowdMode:
         self.inter_window = collections.deque(maxlen=CROWD_WINDOW_FRAMES)
         self.intra_window = collections.deque(maxlen=CROWD_WINDOW_FRAMES)
         self.clog         = get_logger("Crowd")
+        # head sweep state
+        self._sweep_dir:        float = 1.0
+        self._sweep_step_start: float = time.time()
 
     async def reset(self):
+        # Stop head and legs immediately
         await publish_velocity(self.r, 0.0, 0.0)
         self.inter_window.clear()
         self.intra_window.clear()
+        self._sweep_dir        = 1.0
+        self._sweep_step_start = time.time()
+        # Give head a moment to coast, then trigger smart recalibration in hardware
+        await asyncio.sleep(0.2)
+        await self.r.publish("chippy:cmd:calibrate", "1")
+        self.clog.info("CROWD exit — recalibration triggered")
 
     def _classify(self, avg_inter: float) -> str:
         if avg_inter >= CROWD_HIGH_THRESHOLD:
@@ -213,6 +225,13 @@ class CrowdMode:
         elif avg_inter >= CROWD_LOW_THRESHOLD:
             return "LOW"
         return "EMPTY"
+
+    def _sweep_w(self) -> float:
+        """Continuous head sweep — flips direction every CROWD_HEAD_SWEEP_DURATION seconds."""
+        if time.time() - self._sweep_step_start >= CROWD_HEAD_SWEEP_DURATION:
+            self._sweep_dir        = -self._sweep_dir
+            self._sweep_step_start = time.time()
+        return self._sweep_dir * CROWD_HEAD_SWEEP_SPEED
 
     async def update(self):
         front = await read_front_radar(self.r)
@@ -227,6 +246,9 @@ class CrowdMode:
         avg_inter = sum(self.inter_window) / len(self.inter_window)
         avg_intra = sum(self.intra_window) / len(self.intra_window)
         density   = self._classify(avg_inter)
+
+        # Legs always stopped, head sweeps continuously
+        await publish_velocity(self.r, 0.0, self._sweep_w())
 
         await self.r.set(KEY_CROWD, orjson.dumps({
             "density":   density,
