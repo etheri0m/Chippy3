@@ -24,7 +24,8 @@ def velocity_to_motor(value: float, target: str) -> dict:
 
 
 async def run_kinematics():
-    r = avalkey.Valkey(host='localhost', port=6379, decode_responses=True)
+    r = avalkey.Valkey(host='localhost', port=6379, decode_responses=True,
+                       socket_timeout=None)
     pubsub = r.pubsub()
     await pubsub.subscribe(KEY_VELOCITY)
 

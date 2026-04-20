@@ -23,40 +23,65 @@ SWEEP_DURATION = 0.8
 SWEEP_TIMEOUT  = 3.0
 
 # --- CROWD mode ---
-CROWD_WINDOW_FRAMES      = 40
-CROWD_HIGH_THRESHOLD     = 8.0
-CROWD_LOW_THRESHOLD      = 3.0
-CROWD_HEAD_SWEEP_SPEED    = 0.5   # gentle pan — looks natural
-CROWD_HEAD_SWEEP_DURATION = 1.2   # seconds per direction
+CROWD_WINDOW_FRAMES       = 40
+CROWD_HIGH_THRESHOLD      = 8.0
+CROWD_LOW_THRESHOLD       = 3.0
+CROWD_HEAD_SWEEP_SPEED    = 0.5
+CROWD_HEAD_SWEEP_DURATION = 1.2
 
-# --- MAZE mode ---
-MAZE_FRONT_OBSTACLE_DIST = 0.35
-MAZE_REAR_OBSTACLE_DIST  = 0.25
-MAZE_SEQUENCE = [
-    {"v": 0.7, "w": 0.0,  "duration": 1.5},
-    {"v": 0.0, "w": 0.8,  "duration": 0.4},
-    {"v": 0.7, "w": 0.0,  "duration": 1.2},
-    {"v": 0.0, "w": -0.8, "duration": 0.4},
-    {"v": 0.7, "w": 0.0,  "duration": 1.0},
-    {"v": 0.0, "w": 0.0,  "duration": 0.3},
-]
+# --- MAZE mode (right-hand wall-following) ---
+# Algorithm:
+#   - Drive forward, head/body aligned (hall sensor triggered)
+#   - Front radar continuously monitors what's ahead
+#   - Every PEEK_INTERVAL seconds: stop legs, rotate head right ~90°,
+#     read radar (now pointing right), then either:
+#       a) Right is OPEN (>OPENING dist or no detection) → COMMIT (don't
+#          return head, just drive — body follows head into right corridor)
+#       b) Right is BLOCKED → return head left until hall triggers, resume drive
+#   - If front becomes BLOCKED while driving:
+#       a) Rotate head left ~90°, read radar
+#       b) Left is OPEN → COMMIT left
+#       c) Left is BLOCKED → SPIN_180 (rotate further left ~90° more, drive out)
+#
+# Hall sensor (chippy:state:hall) triggers when head/body aligned (forward).
+# After a commit, we wait for hall to trigger again — meaning the body has
+# rotated to align with where the head is now pointing = ready to drive straight
+# in the new direction.
+MAZE_DRIVE_SPEED       = 0.7
+MAZE_TURN_SPEED        = 0.7
+MAZE_FRONT_BLOCK       = 0.20    # stop forward when wall this close (m)
+MAZE_RIGHT_OPENING     = 0.40    # right reading > this = corridor opening
+MAZE_LEFT_OPENING      = 0.40
+MAZE_PEEK_INTERVAL     = 1.5     # seconds of driving between right peeks
+MAZE_PEEK_TURN_DUR     = 0.50    # time to rotate head ~90° (TUNE in test_turns.py)
+MAZE_RADAR_SETTLE      = 0.15    # wait after head stops for fresh radar reading
+MAZE_HALL_TIMEOUT      = 3.0     # max wait for hall after a commit
+MAZE_RECENTER_TIMEOUT  = 1.5     # max wait for hall during peek-return
+MAZE_REAR_SAFE_DIST    = 0.20    # for any future reverse safety check
 
 # --- Valkey keys ---
-KEY_MODE       = 'chippy:mode'
-KEY_VELOCITY   = 'chippy:cmd:velocity'
-KEY_RADAR_REAR = 'chippy:state:radar:rear'
-KEY_RADAR_FR   = 'chippy:state:radar:front'
-KEY_CROWD      = 'chippy:state:crowd'
-KEY_MAZE       = 'chippy:state:maze'
+KEY_MODE             = 'chippy:mode'
+KEY_VELOCITY         = 'chippy:cmd:velocity'
+KEY_RADAR_REAR       = 'chippy:state:radar:rear'
+KEY_RADAR_FR         = 'chippy:state:radar:front'
+KEY_CROWD            = 'chippy:state:crowd'
+KEY_MAZE             = 'chippy:state:maze'
+KEY_HEAD_STATE       = 'chippy:state:head'
+KEY_HALL             = 'chippy:state:hall'         # "1" if head centered
+KEY_MAZE_START       = 'chippy:cmd:maze:start'
+KEY_DIST_CALIBRATED  = 'chippy:state:radar:dist_calibrated'
+CH_CALIBRATE         = 'chippy:cmd:calibrate'
 
 MODE_FOLLOW = "FOLLOW"
 MODE_CROWD  = "CROWD"
 MODE_MAZE   = "MAZE"
-VALID_MODES = {MODE_FOLLOW, MODE_CROWD, MODE_MAZE}
+MODE_IDLE   = "IDLE"
+VALID_MODES = {MODE_FOLLOW, MODE_CROWD, MODE_MAZE, MODE_IDLE}
 
 
 async def publish_velocity(r, v: float, w: float):
-    await r.publish(KEY_VELOCITY, orjson.dumps({"v": round(v, 3), "w": round(w, 3)}).decode())
+    await r.publish(KEY_VELOCITY,
+                    orjson.dumps({"v": round(v, 3), "w": round(w, 3)}).decode())
 
 
 async def read_front_radar(r) -> dict:
@@ -80,7 +105,7 @@ async def read_rear_radar(r) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Head sweep-and-lock
+# Head sweep-and-lock (used by FOLLOW)
 # ---------------------------------------------------------------------------
 
 class HeadSweep:
@@ -95,6 +120,7 @@ class HeadSweep:
         self.sweep_start  = None
         self.sweep_total  = None
         self.last_w       = None
+        self.last_v       = None
         self.hlog         = get_logger("Head")
 
     async def reset(self):
@@ -103,11 +129,13 @@ class HeadSweep:
         self.sweep_start = None
         self.sweep_total = None
         self.last_w      = None
+        self.last_v      = None
 
     async def _send_w(self, w: float, v: float = 0.0):
-        if w != self.last_w:
+        if w != self.last_w or v != self.last_v:
             await publish_velocity(self.r, v, w)
             self.last_w = w
+            self.last_v = v
 
     async def update(self, front: dict, leg_v: float = 0.0):
         if front["detected"]:
@@ -184,7 +212,6 @@ class FollowMode:
             zone  = "HOLD"
 
         head_state = await self.head.update(front, leg_v)
-
         dist_str = f"{raw_dist:.3f}m" if raw_dist is not None else "None   "
         intra_str = f"{front.get('intra', 0.0):.1f}"
         self.flog.debug(
@@ -203,20 +230,17 @@ class CrowdMode:
         self.inter_window = collections.deque(maxlen=CROWD_WINDOW_FRAMES)
         self.intra_window = collections.deque(maxlen=CROWD_WINDOW_FRAMES)
         self.clog         = get_logger("Crowd")
-        # head sweep state
         self._sweep_dir:        float = 1.0
         self._sweep_step_start: float = time.time()
 
     async def reset(self):
-        # Stop head and legs immediately
         await publish_velocity(self.r, 0.0, 0.0)
         self.inter_window.clear()
         self.intra_window.clear()
         self._sweep_dir        = 1.0
         self._sweep_step_start = time.time()
-        # Give head a moment to coast, then trigger smart recalibration in hardware
         await asyncio.sleep(0.2)
-        await self.r.publish("chippy:cmd:calibrate", "1")
+        await self.r.publish(CH_CALIBRATE, "1")
         self.clog.info("CROWD exit — recalibration triggered")
 
     def _classify(self, avg_inter: float) -> str:
@@ -227,7 +251,6 @@ class CrowdMode:
         return "EMPTY"
 
     def _sweep_w(self) -> float:
-        """Continuous head sweep — flips direction every CROWD_HEAD_SWEEP_DURATION seconds."""
         if time.time() - self._sweep_step_start >= CROWD_HEAD_SWEEP_DURATION:
             self._sweep_dir        = -self._sweep_dir
             self._sweep_step_start = time.time()
@@ -247,7 +270,6 @@ class CrowdMode:
         avg_intra = sum(self.intra_window) / len(self.intra_window)
         density   = self._classify(avg_inter)
 
-        # Legs always stopped, head sweeps continuously
         await publish_velocity(self.r, 0.0, self._sweep_w())
 
         await self.r.set(KEY_CROWD, orjson.dumps({
@@ -263,98 +285,271 @@ class CrowdMode:
 
 
 # ---------------------------------------------------------------------------
-# MAZE mode
+# MAZE mode — right-hand wall following
 # ---------------------------------------------------------------------------
 
 class MazeMode:
+    S_ARMED          = "ARMED"
+    S_DRIVE          = "DRIVE"
+    S_PEEK_R_TURN    = "PEEK_R_TURN"
+    S_PEEK_R_READ    = "PEEK_R_READ"
+    S_PEEK_R_RETURN  = "PEEK_R_RETURN"
+    S_COMMIT_R       = "COMMIT_R"
+    S_PEEK_L_TURN    = "PEEK_L_TURN"
+    S_PEEK_L_READ    = "PEEK_L_READ"
+    S_COMMIT_L       = "COMMIT_L"
+    S_SPIN_180_TURN  = "SPIN_180_TURN"
+    S_SPIN_180_DRIVE = "SPIN_180_DRIVE"
+
     def __init__(self, r):
-        self.r             = r
-        self.step          = 0
-        self.step_start    = None
-        self.active        = False
-        self.obstacle_hold = False
-        self.mlog          = get_logger("Maze")
+        self.r              = r
+        self.state          = None
+        self.state_start    = 0.0
+        self.active         = False
+        self.mlog           = get_logger("Maze")
+        self.last_peek_time = 0.0
+        self.peek_dist      = None
+        self.left_dist      = None
 
     async def reset(self):
         await publish_velocity(self.r, 0.0, 0.0)
-        self.step          = 0
-        self.step_start    = None
-        self.active        = False
-        self.obstacle_hold = False
+        self.state          = None
+        self.active         = False
+        self.last_peek_time = 0.0
+        self.peek_dist      = None
+        self.left_dist      = None
+        try:
+            await self.r.delete(KEY_MAZE_START)
+        except Exception:
+            pass
 
     async def start(self):
-        self.step          = 0
-        self.step_start    = time.time()
-        self.active        = True
-        self.obstacle_hold = False
-        await self._dispatch_step()
+        await publish_velocity(self.r, 0.0, 0.0)
+        try:
+            await self.r.delete(KEY_MAZE_START)
+        except Exception:
+            pass
+        await self._enter(self.S_ARMED)
+        self.active = True
+        self.mlog.info("Armed — waiting for radar calibration + start signal")
 
-    async def _dispatch_step(self):
-        s = MAZE_SEQUENCE[self.step]
-        await publish_velocity(self.r, s["v"], s["w"])
-        self.mlog.info(
-            "Step {}/{} — v:{:+.1f} w:{:+.1f} for {}s",
-            self.step + 1, len(MAZE_SEQUENCE), s['v'], s['w'], s['duration']
-        )
-        await self._publish_state("RUNNING")
+    # ------------------------------------------------------------------
+    async def _enter(self, new_state: str):
+        self.state       = new_state
+        self.state_start = time.time()
+        self.mlog.info("→ {}", new_state)
+        await self._publish_state(new_state)
 
     async def _publish_state(self, status: str):
         await self.r.set(KEY_MAZE, orjson.dumps({
-            "status":      status,
-            "step":        self.step + 1,
-            "total_steps": len(MAZE_SEQUENCE),
-            "obstacle":    self.obstacle_hold,
-            "ts":          round(time.time(), 4),
+            "status":    status,
+            "peek_dist": self.peek_dist,
+            "left_dist": self.left_dist,
+            "ts":        round(time.time(), 4),
         }).decode())
 
+    def _elapsed(self) -> float:
+        return time.time() - self.state_start
+
+    async def _hall_centered(self) -> bool:
+        v = await self.r.get(KEY_HALL)
+        return v == "1"
+
+    # ------------------------------------------------------------------
+    # Main tick
+    # ------------------------------------------------------------------
     async def update(self):
         if not self.active:
             await self.start()
             return
 
-        s     = MAZE_SEQUENCE[self.step]
         front = await read_front_radar(self.r)
-        rear  = await read_rear_radar(self.r)
 
-        front_blocked = (
-            s["v"] > 0 and
-            front["detected"] and
-            front["dist"] is not None and
-            front["dist"] < MAZE_FRONT_OBSTACLE_DIST
-        )
+        # ---- ARMED ----------------------------------------------------
+        if self.state == self.S_ARMED:
+            calibrated = await self.r.get(KEY_DIST_CALIBRATED)
+            if not calibrated:
+                if int(self._elapsed()) % 2 == 0 and self._elapsed() % 1.0 < 0.1:
+                    self.mlog.info("Waiting for radar calibration — hold robot in free space...")
+                return
 
-        rear_blocked = (
-            s["v"] < 0 and
-            rear["detected"] and
-            rear["dist"] is not None and
-            rear["dist"] < MAZE_REAR_OBSTACLE_DIST
-        )
+            flag = await self.r.get(KEY_MAZE_START)
+            if flag:
+                await self.r.delete(KEY_MAZE_START)
+                self.mlog.info("Start received — driving forward")
+                self.last_peek_time = time.time()
+                await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
+                await self._enter(self.S_DRIVE)
+            elif int(self._elapsed()) % 2 == 0 and self._elapsed() % 1.0 < 0.1:
+                self.mlog.info(
+                    "Radar ready — place robot then: redis-cli set {} 1", KEY_MAZE_START
+                )
+            return
 
-        obstacle_now = front_blocked or rear_blocked
+        # ---- DRIVE ----------------------------------------------------
+        # Head and body aligned (hall triggered), legs forward.
+        # Two reactive triggers: front blocked → check left; peek timer → check right
+        if self.state == self.S_DRIVE:
+            blocked = (
+                front["detected"] and
+                front["dist"] is not None and
+                front["dist"] < MAZE_FRONT_BLOCK
+            )
+            if blocked:
+                self.mlog.warning("Front blocked at {:.2f}m — checking left", front["dist"])
+                await publish_velocity(self.r, 0.0, 0.0)
+                # Begin left rotation
+                await publish_velocity(self.r, 0.0, -MAZE_TURN_SPEED)
+                await self._enter(self.S_PEEK_L_TURN)
+                return
 
-        if obstacle_now and not self.obstacle_hold:
-            self.obstacle_hold = True
-            await publish_velocity(self.r, 0.0, s["w"])
-            direction = "front" if front_blocked else "rear"
-            dist = front["dist"] if front_blocked else rear["dist"]
-            self.mlog.warning("{} obstacle at {:.2f}m — legs paused", direction, dist)
-            await self._publish_state("OBSTACLE_HOLD")
-        elif not obstacle_now and self.obstacle_hold:
-            self.obstacle_hold = False
-            await publish_velocity(self.r, s["v"], s["w"])
-            self.mlog.info("Obstacle cleared — resuming")
+            if time.time() - self.last_peek_time >= MAZE_PEEK_INTERVAL:
+                f_str = f"{front['dist']:.2f}m" if front.get('dist') is not None else "open"
+                self.mlog.info("Peek-right time (front: {})", f_str)
+                await publish_velocity(self.r, 0.0, 0.0)
+                # Begin right rotation
+                await publish_velocity(self.r, 0.0, MAZE_TURN_SPEED)
+                await self._enter(self.S_PEEK_R_TURN)
+                return
+            return
 
-        if not self.obstacle_hold:
-            if time.time() - self.step_start >= s["duration"]:
-                self.step += 1
-                if self.step >= len(MAZE_SEQUENCE):
-                    await publish_velocity(self.r, 0.0, 0.0)
-                    await self._publish_state("COMPLETE")
-                    self.mlog.success("Sequence complete")
-                    self.active = False
-                    return
-                self.step_start = time.time()
-                await self._dispatch_step()
+        # ---- PEEK_R_TURN ----------------------------------------------
+        # Rotating head ~90° right (timed). Hall will go off shortly after start.
+        if self.state == self.S_PEEK_R_TURN:
+            if self._elapsed() >= MAZE_PEEK_TURN_DUR:
+                await publish_velocity(self.r, 0.0, 0.0)
+                await self._enter(self.S_PEEK_R_READ)
+            return
+
+        # ---- PEEK_R_READ ----------------------------------------------
+        # Head pointing right (legs stopped). Wait for fresh radar reading.
+        if self.state == self.S_PEEK_R_READ:
+            if self._elapsed() < MAZE_RADAR_SETTLE:
+                return
+            d = front.get("dist")
+            self.peek_dist = round(d, 3) if d is not None else None
+            d_str = f"{d:.2f}m" if d is not None else "OPEN"
+            self.mlog.info("Right peek: {}", d_str)
+
+            if d is None or d > MAZE_RIGHT_OPENING:
+                # Right is open — commit (don't return head, just drive)
+                self.mlog.success("Right opening detected → committing right")
+                await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
+                await self._enter(self.S_COMMIT_R)
+            else:
+                # Right blocked — return head to centered, then resume drive
+                self.mlog.info("Right blocked — returning head to center")
+                await publish_velocity(self.r, 0.0, -MAZE_TURN_SPEED)
+                await self._enter(self.S_PEEK_R_RETURN)
+            return
+
+        # ---- PEEK_R_RETURN --------------------------------------------
+        # Rotating head left until hall triggers (head centered = forward)
+        if self.state == self.S_PEEK_R_RETURN:
+            centered = await self._hall_centered()
+            if centered or self._elapsed() >= MAZE_RECENTER_TIMEOUT:
+                if not centered:
+                    self.mlog.warning("Recenter timeout — proceeding anyway")
+                await publish_velocity(self.r, 0.0, 0.0)
+                await asyncio.sleep(0.05)
+                await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
+                self.last_peek_time = time.time()
+                await self._enter(self.S_DRIVE)
+            return
+
+        # ---- COMMIT_R -------------------------------------------------
+        # Head pointing right, legs forward. Body follows head.
+        # Wait for hall to trigger again — meaning body has rotated to align
+        # with where the head is pointing → ready to drive straight.
+        if self.state == self.S_COMMIT_R:
+            centered = await self._hall_centered()
+            if centered:
+                self.mlog.success("Body aligned with head — straight drive")
+                self.last_peek_time = time.time()
+                await self._enter(self.S_DRIVE)
+            elif self._elapsed() >= MAZE_HALL_TIMEOUT:
+                self.mlog.warning("Commit hall timeout — proceeding to DRIVE anyway")
+                self.last_peek_time = time.time()
+                await self._enter(self.S_DRIVE)
+            return
+
+        # ---- PEEK_L_TURN ----------------------------------------------
+        if self.state == self.S_PEEK_L_TURN:
+            if self._elapsed() >= MAZE_PEEK_TURN_DUR:
+                await publish_velocity(self.r, 0.0, 0.0)
+                await self._enter(self.S_PEEK_L_READ)
+            return
+
+        # ---- PEEK_L_READ ----------------------------------------------
+        if self.state == self.S_PEEK_L_READ:
+            if self._elapsed() < MAZE_RADAR_SETTLE:
+                return
+            d = front.get("dist")
+            self.left_dist = round(d, 3) if d is not None else None
+            d_str = f"{d:.2f}m" if d is not None else "OPEN"
+            self.mlog.info("Left peek: {}", d_str)
+
+            if d is None or d > MAZE_LEFT_OPENING:
+                self.mlog.success("Left opening detected → committing left")
+                await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
+                await self._enter(self.S_COMMIT_L)
+            else:
+                self.mlog.warning("Dead end (front + left blocked) — spinning 180")
+                # Continue rotating left for another ~90° to reach 180° from start
+                await publish_velocity(self.r, 0.0, -MAZE_TURN_SPEED)
+                await self._enter(self.S_SPIN_180_TURN)
+            return
+
+        # ---- COMMIT_L -------------------------------------------------
+        if self.state == self.S_COMMIT_L:
+            centered = await self._hall_centered()
+            if centered:
+                self.mlog.success("Body aligned with head — straight drive")
+                self.last_peek_time = time.time()
+                await self._enter(self.S_DRIVE)
+            elif self._elapsed() >= MAZE_HALL_TIMEOUT:
+                self.mlog.warning("Commit hall timeout — proceeding to DRIVE anyway")
+                self.last_peek_time = time.time()
+                await self._enter(self.S_DRIVE)
+            return
+
+        # ---- SPIN_180_TURN --------------------------------------------
+        # Already rotated ~90° left (during PEEK_L), now another ~90° to hit 180°
+        if self.state == self.S_SPIN_180_TURN:
+            if self._elapsed() >= MAZE_PEEK_TURN_DUR:
+                await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
+                await self._enter(self.S_SPIN_180_DRIVE)
+            return
+
+        # ---- SPIN_180_DRIVE -------------------------------------------
+        # Head at 180° from original, legs driving. Body follows.
+        if self.state == self.S_SPIN_180_DRIVE:
+            centered = await self._hall_centered()
+            if centered:
+                self.mlog.success("Body realigned after 180 — straight drive")
+                self.last_peek_time = time.time()
+                await self._enter(self.S_DRIVE)
+            elif self._elapsed() >= MAZE_HALL_TIMEOUT:
+                self.mlog.warning("Spin-180 hall timeout — proceeding to DRIVE anyway")
+                self.last_peek_time = time.time()
+                await self._enter(self.S_DRIVE)
+            return
+
+
+# ---------------------------------------------------------------------------
+# IDLE mode
+# ---------------------------------------------------------------------------
+
+class IdleMode:
+    def __init__(self, r):
+        self.r    = r
+        self.ilog = get_logger("Idle")
+
+    async def reset(self):
+        await publish_velocity(self.r, 0.0, 0.0)
+
+    async def update(self):
+        await publish_velocity(self.r, 0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +562,6 @@ async def run_controller():
     if not await r.exists(KEY_MODE):
         await r.set(KEY_MODE, MODE_FOLLOW)
 
-    # Rear radar is optional
     rear_detector = None
     rear_client   = None
     try:
@@ -390,6 +584,7 @@ async def run_controller():
     follow = FollowMode(r)
     crowd  = CrowdMode(r)
     maze   = MazeMode(r)
+    idle   = IdleMode(r)
 
     active_mode = None
 
@@ -398,23 +593,23 @@ async def run_controller():
     else:
         log.info("Running — front radar only")
     log.info("Modes: redis-cli set {} FOLLOW|CROWD|MAZE", KEY_MODE)
-    log.info("FOLLOW zones: <{}m back | {}-{}m hold | >{}m forward",
-             NEAR_ZONE, NEAR_ZONE, FAR_ZONE, FAR_ZONE)
+    log.info("MAZE start: redis-cli set {} 1  (after placing Chipz)", KEY_MAZE_START)
 
     try:
         while True:
             if rear_detector:
-                result = await asyncio.to_thread(rear_detector.get_next)
-                detected = result.presence_detected
-                raw_dist = result.presence_distance if detected else None
-                intra    = result.intra_presence_score
-                inter    = result.inter_presence_score
+                result   = await asyncio.to_thread(rear_detector.get_next)
+                pres     = result
+                detected = bool(pres.presence_detected)
+                raw_dist = pres.presence_distance if detected else None
+                intra    = pres.intra_presence_score
+                inter    = pres.inter_presence_score
 
                 await r.set(KEY_RADAR_REAR, orjson.dumps({
                     "detected": detected,
-                    "dist":     raw_dist,
-                    "intra":    round(intra, 2),
-                    "inter":    round(inter, 2),
+                    "dist":     float(raw_dist) if raw_dist is not None else None,
+                    "intra":    round(float(intra), 2),
+                    "inter":    round(float(inter), 2),
                     "ts":       round(time.time(), 4),
                 }).decode())
             else:
@@ -428,6 +623,7 @@ async def run_controller():
                 if active_mode == MODE_FOLLOW: await follow.reset()
                 elif active_mode == MODE_CROWD: await crowd.reset()
                 elif active_mode == MODE_MAZE:  await maze.reset()
+                elif active_mode == MODE_IDLE:  await idle.reset()
                 active_mode = mode
 
             if mode == MODE_FOLLOW:
@@ -436,6 +632,8 @@ async def run_controller():
                 await crowd.update()
             elif mode == MODE_MAZE:
                 await maze.update()
+            elif mode == MODE_IDLE:
+                await idle.update()
 
     except asyncio.CancelledError:
         pass

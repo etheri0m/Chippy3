@@ -107,6 +107,8 @@ KEYS = {
     "maze":        "chippy:state:maze",
 }
 
+KEY_MAZE_START = "chippy:cmd:maze:start"
+
 VALID_MODES = ["FOLLOW", "CROWD", "MAZE"]
 POLL_INTERVAL = 0.2
 
@@ -224,6 +226,33 @@ async def set_mode(mode: str):
     log.info("Mode set to {}", mode)
 
 
+async def maze_start():
+    """Signal MazeMode to begin its run (after user places Chipz)."""
+    if DEMO_MODE:
+        log.info("Demo: maze start clicked")
+        return
+    await vk.set(KEY_MAZE_START, "1")
+    log.info("Maze start signal sent")
+
+
+async def emergency_stop():
+    """Halt everything — send zero velocity and switch to IDLE mode."""
+    if DEMO_MODE:
+        _demo_state["mode"] = "IDLE"
+        log.warning("Demo: STOP clicked")
+        return
+    # 1. Kill motors now
+    await vk.publish("chippy:cmd:velocity", orjson.dumps({"v": 0.0, "w": 0.0}).decode())
+    # 2. Switch to IDLE so nothing re-publishes a non-zero velocity
+    await vk.set(KEYS["mode"], "IDLE")
+    # 3. Clear any pending maze start flag so switching back to MAZE is safe
+    try:
+        await vk.delete(KEY_MAZE_START)
+    except Exception:
+        pass
+    log.warning("EMERGENCY STOP")
+
+
 def fmt(v, dp=2) -> str:
     if v is None:
         return "—"
@@ -286,9 +315,17 @@ def dashboard():
         ui.label("CHIPPYPI").style(
             "font-size:22px; font-weight:700; letter-spacing:3px; color:#00d4aa;"
         )
-        with ui.row().classes("items-center gap-2"):
-            conn_dot = ui.icon("circle").style("font-size:10px; color:#ff4a6b;")
-            conn_text = ui.label("connecting...").style("font-size:11px; color:#6b6b76;")
+        with ui.row().classes("items-center gap-4"):
+            ui.button("STOP", on_click=lambda: emergency_stop()).props(
+                "flat dense"
+            ).style(
+                "padding:10px 24px; font-size:13px; font-weight:700; "
+                "letter-spacing:2px; border:2px solid #ff4a6b; border-radius:6px; "
+                "background:#ff4a6b !important; color:#0c0c0f !important;"
+            )
+            with ui.row().classes("items-center gap-2"):
+                conn_dot = ui.icon("circle").style("font-size:10px; color:#ff4a6b;")
+                conn_text = ui.label("connecting...").style("font-size:11px; color:#6b6b76;")
 
     ui.separator().style("background:#2a2a30;")
 
@@ -429,6 +466,14 @@ def dashboard():
             maze_bar = ui.linear_progress(value=0, show_value=False).style(
                 "height:8px; margin-top:8px;"
             ).props("color='light-blue'")
+            maze_start_btn = ui.button(
+                "START", on_click=lambda: maze_start()
+            ).props("flat dense").style(
+                "width:100%; margin-top:10px; padding:10px 0; font-size:12px; "
+                "font-weight:700; letter-spacing:2px; border:1px solid #2a2a30; "
+                "border-radius:6px; color:#6b6b76;"
+            )
+            maze_start_btn.disable()
 
         # ── MANUAL CONTROL ──
         with ui.card().classes("p-4"):
@@ -471,8 +516,9 @@ def dashboard():
                 mz   = await vk_get(KEYS["maze"])
 
             mode_label.text = mode
+            # In IDLE (from STOP button) no mode button should look active
             for m, btn in mode_btns.items():
-                if m == mode:
+                if m == mode and mode != "IDLE":
                     btn.style(
                         "flex:1; padding:8px 0; font-size:12px; font-weight:600; "
                         "letter-spacing:1px; border:1px solid #00d4aa; border-radius:6px; "
@@ -543,6 +589,28 @@ def dashboard():
                 maze_step.text = f"{step} / {total}"
                 maze_obstacle.text = "BLOCKED" if mz.get("obstacle") else "clear"
                 maze_bar.value = (step / total) if total > 0 else 0
+
+            # Enable START only when we're in MAZE mode and waiting for go
+            maze_armed = (
+                mode == "MAZE" and
+                mz is not None and
+                mz.get("status") == "ARMED"
+            )
+            if maze_armed:
+                maze_start_btn.enable()
+                maze_start_btn.style(
+                    "width:100%; margin-top:10px; padding:10px 0; font-size:12px; "
+                    "font-weight:700; letter-spacing:2px; border:1px solid #00d4aa; "
+                    "border-radius:6px; background:#00d4aa !important; "
+                    "color:#0c0c0f !important;"
+                )
+            else:
+                maze_start_btn.disable()
+                maze_start_btn.style(
+                    "width:100%; margin-top:10px; padding:10px 0; font-size:12px; "
+                    "font-weight:700; letter-spacing:2px; border:1px solid #2a2a30; "
+                    "border-radius:6px; color:#6b6b76; background:transparent !important;"
+                )
 
             if DEMO_MODE:
                 conn_dot.style("font-size:10px; color:#ffc44a;")
