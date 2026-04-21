@@ -1,140 +1,57 @@
 """
-Interactive turn tuner for Chippy.
-Publishes velocity commands directly — no maze logic, no radar.
-Run alongside the hardware stack (core_hardware + core_kinematics must be running):
-    uv run test_turns.py
-
-Keys:
-    l  — turn LEFT  (w = -TURN_SPEED for TURN_DURATION)
-    r  — turn RIGHT (w = +TURN_SPEED for TURN_DURATION)
-    s  — scan left  (head only, legs stopped)
-    d  — scan right (head only, legs stopped)
-    f  — drive forward for DRIVE_DURATION then stop
-    b  — drive backward for DRIVE_DURATION then stop
-    +  — increase TURN_DURATION by 0.05s
-    -  — decrease TURN_DURATION by 0.05s
-    ]  — increase TURN_SPEED by 0.05
-    [  — decrease TURN_SPEED by 0.05
-    p  — print current settings
-    q  — quit (sends stop first)
+Test 90° head turn. Sets mode to MAZE first (ARMED state does nothing),
+so the main loop won't fight our commands. Run WITH main.py running.
+    uv run test_90.py
 """
 import asyncio
-import sys
 import orjson
 import valkey.asyncio as avalkey
 
-KEY_VELOCITY = "chippy:cmd:velocity"
+# ─── TUNE THIS ────────────────────────────────────────
+TURN_DURATION = 1.4    # seconds
+TURN_SPEED    = 0.7     # 0.0 - 1.0
+# ──────────────────────────────────────────────────────
 
-# ── Tunable settings ──────────────────────────────────────────────────────────
-TURN_SPEED      = 0.80   # w for body turns
-TURN_DURATION   = 0.50   # seconds — this is what you tune for 90°
-SCAN_SPEED      = 0.70   # w for head scans
-SCAN_DURATION   = 0.80   # seconds per scan sweep
-DRIVE_SPEED     = 0.70   # v for forward/backward test
-DRIVE_DURATION  = 0.50   # seconds of driving
+KEY_MOTORS = "chippy:cmd:motors"
 
 
-async def pub(r, v: float, w: float):
-    await r.publish(KEY_VELOCITY,
-                    orjson.dumps({"v": round(v, 3), "w": round(w, 3)}).decode())
-
-
-async def stop(r):
-    await pub(r, 0.0, 0.0)
-
-
-async def run_turn(r, direction: float, label: str):
-    global TURN_SPEED, TURN_DURATION
-    print(f"  {label} — speed={TURN_SPEED:.2f}  duration={TURN_DURATION:.2f}s")
-    await pub(r, 0.0, direction * TURN_SPEED)
-    await asyncio.sleep(TURN_DURATION)
-    await stop(r)
-    print(f"  done")
-
-
-async def run_scan(r, direction: float, label: str):
-    global SCAN_SPEED, SCAN_DURATION
-    print(f"  {label} — speed={SCAN_SPEED:.2f}  duration={SCAN_DURATION:.2f}s")
-    await pub(r, 0.0, direction * SCAN_SPEED)
-    await asyncio.sleep(SCAN_DURATION)
-    await stop(r)
-    print(f"  done")
-
-
-async def run_drive(r, direction: float, label: str):
-    global DRIVE_SPEED, DRIVE_DURATION
-    print(f"  {label} — speed={DRIVE_SPEED:.2f}  duration={DRIVE_DURATION:.2f}s")
-    await pub(r, direction * DRIVE_SPEED, 0.0)
-    await asyncio.sleep(DRIVE_DURATION)
-    await stop(r)
-    print(f"  done")
-
-
-def print_settings():
-    print(f"\n  ── Current settings ──────────────────")
-    print(f"  TURN_SPEED     = {TURN_SPEED:.2f}")
-    print(f"  TURN_DURATION  = {TURN_DURATION:.2f}s  ← main tuning knob for 90°")
-    print(f"  SCAN_SPEED     = {SCAN_SPEED:.2f}")
-    print(f"  SCAN_DURATION  = {SCAN_DURATION:.2f}s")
-    print(f"  DRIVE_SPEED    = {DRIVE_SPEED:.2f}")
-    print(f"  DRIVE_DURATION = {DRIVE_DURATION:.2f}s")
-    print(f"  ──────────────────────────────────────\n")
+async def motor(r, target: str, direction: str, speed: float):
+    await r.publish(KEY_MOTORS,
+                    orjson.dumps({"target": target, "dir": direction,
+                                  "speed": round(speed, 3)}).decode())
 
 
 async def main():
-    global TURN_SPEED, TURN_DURATION, SCAN_SPEED, SCAN_DURATION
-
     r = avalkey.Valkey(host='localhost', port=6379, decode_responses=True)
-    await stop(r)
 
-    print(__doc__)
-    print_settings()
+    # Put controller in MAZE/ARMED — it publishes nothing while waiting
+    print("Setting mode to MAZE (ARMED = silent)...")
+    await r.set("chippy:mode", "MAZE")
+    await asyncio.sleep(1.0)
 
-    # Put stdin in raw mode so we get keypresses without Enter
-    import tty, termios
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
+    print(f"TURN_DURATION = {TURN_DURATION}s")
+    print(f"TURN_SPEED    = {TURN_SPEED}")
+    print("\nStarting in 2s...")
+    await motor(r, "head", "stop", 0.0)
+    await motor(r, "legs", "stop", 0.0)
+    await asyncio.sleep(2.0)
 
-    try:
-        tty.setraw(fd)
-        while True:
-            ch = sys.stdin.read(1)
+    print("→ HEAD right (forward)")
+    await motor(r, "head", "forward", TURN_SPEED)
+    await asyncio.sleep(TURN_DURATION)
+    await motor(r, "head", "stop", 0.0)
 
-            if ch == 'q':
-                await stop(r)
-                break
-            elif ch == 'l':
-                await run_turn(r, -1.0, "LEFT turn")
-            elif ch == 'r':
-                await run_turn(r, +1.0, "RIGHT turn")
-            elif ch == 's':
-                await run_scan(r, -1.0, "Scan LEFT")
-            elif ch == 'd':
-                await run_scan(r, +1.0, "Scan RIGHT")
-            elif ch == 'f':
-                await run_drive(r, +1.0, "Forward")
-            elif ch == 'b':
-                await run_drive(r, -1.0, "Backward")
-            elif ch == '+':
-                TURN_DURATION = round(TURN_DURATION + 0.05, 2)
-                print(f"  TURN_DURATION → {TURN_DURATION:.2f}s")
-            elif ch == '-':
-                TURN_DURATION = round(max(0.05, TURN_DURATION - 0.05), 2)
-                print(f"  TURN_DURATION → {TURN_DURATION:.2f}s")
-            elif ch == ']':
-                TURN_SPEED = round(min(1.0, TURN_SPEED + 0.05), 2)
-                print(f"  TURN_SPEED → {TURN_SPEED:.2f}")
-            elif ch == '[':
-                TURN_SPEED = round(max(0.1, TURN_SPEED - 0.05), 2)
-                print(f"  TURN_SPEED → {TURN_SPEED:.2f}")
-            elif ch == 'p':
-                print_settings()
+    print("Holding 2s — check the angle...")
+    await asyncio.sleep(2.0)
 
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        await stop(r)
-        await r.aclose()
-        print("\nStopped.")
+    print("→ HEAD left (backward)")
+    await motor(r, "head", "backward", TURN_SPEED)
+    await asyncio.sleep(TURN_DURATION)
+    await motor(r, "head", "stop", 0.0)
+
+    print("\nDone. Setting mode back to IDLE.")
+    await r.set("chippy:mode", "IDLE")
+    await r.aclose()
 
 
 if __name__ == "__main__":

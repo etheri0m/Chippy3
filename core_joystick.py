@@ -49,12 +49,14 @@ CROWD_HEAD_SWEEP_DURATION = 1.2
 # in the new direction.
 MAZE_DRIVE_SPEED       = 0.7
 MAZE_TURN_SPEED        = 0.7
-MAZE_FRONT_BLOCK       = 0.20    # stop forward when wall this close (m)
-MAZE_RIGHT_OPENING     = 0.40    # right reading > this = corridor opening
-MAZE_LEFT_OPENING      = 0.40
-MAZE_PEEK_INTERVAL     = 1.5     # seconds of driving between right peeks
-MAZE_PEEK_TURN_DUR     = 0.50    # time to rotate head ~90° (TUNE in test_turns.py)
+MAZE_FRONT_BLOCK       = 0.150    # stop forward when wall this close (m)
+MAZE_RIGHT_OPENING     = 0.45    # right reading > this = corridor opening
+MAZE_LEFT_OPENING      = 0.45
+MAZE_PEEK_INTERVAL     = 4.0     # seconds of driving between right peeks
+MAZE_PEEK_TURN_DUR     = 1.50    # time to rotate head ~90° (TUNE in test_turns.py)
 MAZE_RADAR_SETTLE      = 0.15    # wait after head stops for fresh radar reading
+MAZE_PEEK_CONFIRM_DUR  = 0.30    # collect samples for this long — all must show open
+MAZE_PEEK_MIN_SAMPLES  = 4       # require at least this many samples (20Hz → ~6/0.3s)
 MAZE_HALL_TIMEOUT      = 3.0     # max wait for hall after a commit
 MAZE_RECENTER_TIMEOUT  = 1.5     # max wait for hall during peek-return
 MAZE_REAR_SAFE_DIST    = 0.20    # for any future reverse safety check
@@ -310,6 +312,7 @@ class MazeMode:
         self.last_peek_time = 0.0
         self.peek_dist      = None
         self.left_dist      = None
+        self._peek_samples: list = []  # collected radar readings during peek-read
 
     async def reset(self):
         await publish_velocity(self.r, 0.0, 0.0)
@@ -318,6 +321,7 @@ class MazeMode:
         self.last_peek_time = 0.0
         self.peek_dist      = None
         self.left_dist      = None
+        self._peek_samples  = []
         try:
             await self.r.delete(KEY_MAZE_START)
         except Exception:
@@ -327,11 +331,17 @@ class MazeMode:
         await publish_velocity(self.r, 0.0, 0.0)
         try:
             await self.r.delete(KEY_MAZE_START)
+            # Clear any stale head calibration state so we wait for a fresh one
+            await self.r.delete(KEY_HEAD_STATE)
         except Exception:
             pass
+        # Kick off head calibration immediately — hardware will run smart_calibrate_head
+        # which ends with head centered (magnet over sensor, hall="1").
+        # Radar calibration happens in parallel (core_radar.py does it on mode switch).
+        await self.r.publish(CH_CALIBRATE, "1")
         await self._enter(self.S_ARMED)
         self.active = True
-        self.mlog.info("Armed — waiting for radar calibration + start signal")
+        self.mlog.info("Armed — calibrating head + radar (hold robot in free space)")
 
     # ------------------------------------------------------------------
     async def _enter(self, new_state: str):
@@ -366,11 +376,30 @@ class MazeMode:
         front = await read_front_radar(self.r)
 
         # ---- ARMED ----------------------------------------------------
+        # Wait for two calibrations to complete before accepting start:
+        #   1. Radar distance detector calibrated (core_radar.py sets KEY_DIST_CALIBRATED)
+        #   2. Head calibrated (core_hardware.py's smart_calibrate_head sets
+        #      KEY_HEAD_STATE with calibrated=True, head ends up centered)
+        # Both run in parallel — so the wait is just "whichever finishes last".
         if self.state == self.S_ARMED:
-            calibrated = await self.r.get(KEY_DIST_CALIBRATED)
-            if not calibrated:
+            radar_ok = bool(await self.r.get(KEY_DIST_CALIBRATED))
+
+            head_ok = False
+            head_raw = await self.r.get(KEY_HEAD_STATE)
+            if head_raw:
+                try:
+                    head_ok = bool(orjson.loads(head_raw).get("calibrated", False))
+                except Exception:
+                    head_ok = False
+
+            if not (radar_ok and head_ok):
+                # Log a status line roughly every 2 seconds
                 if int(self._elapsed()) % 2 == 0 and self._elapsed() % 1.0 < 0.1:
-                    self.mlog.info("Waiting for radar calibration — hold robot in free space...")
+                    self.mlog.info(
+                        "Waiting — radar:{} head:{} (hold robot in free space)",
+                        "OK" if radar_ok else "...",
+                        "OK" if head_ok else "..."
+                    )
                 return
 
             flag = await self.r.get(KEY_MAZE_START)
@@ -382,7 +411,7 @@ class MazeMode:
                 await self._enter(self.S_DRIVE)
             elif int(self._elapsed()) % 2 == 0 and self._elapsed() % 1.0 < 0.1:
                 self.mlog.info(
-                    "Radar ready — place robot then: redis-cli set {} 1", KEY_MAZE_START
+                    "All calibrated — place robot then: redis-cli set {} 1", KEY_MAZE_START
                 )
             return
 
@@ -422,23 +451,49 @@ class MazeMode:
             return
 
         # ---- PEEK_R_READ ----------------------------------------------
-        # Head pointing right (legs stopped). Wait for fresh radar reading.
+        # Head pointing right (legs stopped). Collect samples over
+        # MAZE_PEEK_CONFIRM_DUR — ALL samples must show open to commit.
+        # This rejects one-off false "open" readings at wall edges.
         if self.state == self.S_PEEK_R_READ:
             if self._elapsed() < MAZE_RADAR_SETTLE:
+                self._peek_samples = []
                 return
-            d = front.get("dist")
-            self.peek_dist = round(d, 3) if d is not None else None
-            d_str = f"{d:.2f}m" if d is not None else "OPEN"
-            self.mlog.info("Right peek: {}", d_str)
 
-            if d is None or d > MAZE_RIGHT_OPENING:
-                # Right is open — commit (don't return head, just drive)
-                self.mlog.success("Right opening detected → committing right")
+            # Accumulate the current reading
+            d = front.get("dist")
+            self._peek_samples.append(d)
+
+            # Still collecting
+            if self._elapsed() < MAZE_RADAR_SETTLE + MAZE_PEEK_CONFIRM_DUR:
+                return
+
+            # Need a minimum number of samples to make a decision
+            if len(self._peek_samples) < MAZE_PEEK_MIN_SAMPLES:
+                self.mlog.warning(
+                    "Only {} samples collected, waiting...", len(self._peek_samples)
+                )
+                return
+
+            # Analyse the samples — all must be open for a commit
+            all_open   = all(s is None or s > MAZE_RIGHT_OPENING
+                             for s in self._peek_samples)
+            valid      = [s for s in self._peek_samples if s is not None]
+            closest    = min(valid) if valid else None
+            n_detected = len(valid)
+
+            self.peek_dist = round(closest, 3) if closest is not None else None
+            c_str = f"{closest:.2f}m" if closest is not None else "all-OPEN"
+            self.mlog.info(
+                "Right peek: {} samples, {} detected, closest={}, all_open={}",
+                len(self._peek_samples), n_detected, c_str, all_open
+            )
+
+            if all_open:
+                self.mlog.success("Right opening confirmed → committing right")
                 await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
                 await self._enter(self.S_COMMIT_R)
             else:
-                # Right blocked — return head to centered, then resume drive
-                self.mlog.info("Right blocked — returning head to center")
+                self.mlog.info("Right blocked (or flickering) — returning to center")
                 await publish_velocity(self.r, 0.0, -MAZE_TURN_SPEED)
                 await self._enter(self.S_PEEK_R_RETURN)
             return
@@ -481,21 +536,42 @@ class MazeMode:
             return
 
         # ---- PEEK_L_READ ----------------------------------------------
+        # Same multi-sample confirmation pattern as PEEK_R_READ
         if self.state == self.S_PEEK_L_READ:
             if self._elapsed() < MAZE_RADAR_SETTLE:
+                self._peek_samples = []
                 return
-            d = front.get("dist")
-            self.left_dist = round(d, 3) if d is not None else None
-            d_str = f"{d:.2f}m" if d is not None else "OPEN"
-            self.mlog.info("Left peek: {}", d_str)
 
-            if d is None or d > MAZE_LEFT_OPENING:
-                self.mlog.success("Left opening detected → committing left")
+            d = front.get("dist")
+            self._peek_samples.append(d)
+
+            if self._elapsed() < MAZE_RADAR_SETTLE + MAZE_PEEK_CONFIRM_DUR:
+                return
+
+            if len(self._peek_samples) < MAZE_PEEK_MIN_SAMPLES:
+                self.mlog.warning(
+                    "Only {} samples collected, waiting...", len(self._peek_samples)
+                )
+                return
+
+            all_open = all(s is None or s > MAZE_LEFT_OPENING
+                           for s in self._peek_samples)
+            valid    = [s for s in self._peek_samples if s is not None]
+            closest  = min(valid) if valid else None
+
+            self.left_dist = round(closest, 3) if closest is not None else None
+            c_str = f"{closest:.2f}m" if closest is not None else "all-OPEN"
+            self.mlog.info(
+                "Left peek: {} samples, closest={}, all_open={}",
+                len(self._peek_samples), c_str, all_open
+            )
+
+            if all_open:
+                self.mlog.success("Left opening confirmed → committing left")
                 await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
                 await self._enter(self.S_COMMIT_L)
             else:
                 self.mlog.warning("Dead end (front + left blocked) — spinning 180")
-                # Continue rotating left for another ~90° to reach 180° from start
                 await publish_velocity(self.r, 0.0, -MAZE_TURN_SPEED)
                 await self._enter(self.S_SPIN_180_TURN)
             return

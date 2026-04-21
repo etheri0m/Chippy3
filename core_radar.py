@@ -54,7 +54,7 @@ except TypeError:
 
 # Minimum abs_sweep signal to count as a real wall reflection.
 # Noise floor ~5-40, real wall ~80-140. 60 gives a safe margin.
-MAZE_SIGNAL_THRESHOLD = 60.0
+MAZE_SIGNAL_THRESHOLD = 45.0
 
 
 def _closest_wall(dist_result) -> float | None:
