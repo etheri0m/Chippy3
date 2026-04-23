@@ -1,10 +1,10 @@
 <h1 align="center">
-  🤖 ChippyPi
+  🤖 Chippy
 </h1>
 
 <p align="center">
   <strong>Custom controller for the KOSMOS Chipz hexapod robot</strong><br>
-  Dual radar sensing · Four operating modes · Live web dashboard
+  Dual radar sensing ·Three operating modes · Live web dashboard
 </p>
 
 <p align="center">

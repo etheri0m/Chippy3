@@ -26,8 +26,8 @@ SWEEP_TIMEOUT  = 3.0
 CROWD_WINDOW_FRAMES       = 40
 CROWD_HIGH_THRESHOLD      = 8.0
 CROWD_LOW_THRESHOLD       = 3.0
-CROWD_HEAD_SWEEP_SPEED    = 0.5
-CROWD_HEAD_SWEEP_DURATION = 1.2
+CROWD_HEAD_SWEEP_SPEED    = 0.6
+CROWD_HEAD_SWEEP_DURATION = 2.0
 
 # --- MAZE mode (right-hand wall-following) ---
 # Algorithm:
@@ -49,8 +49,8 @@ CROWD_HEAD_SWEEP_DURATION = 1.2
 # in the new direction.
 MAZE_DRIVE_SPEED       = 0.7
 MAZE_TURN_SPEED        = 0.7
-MAZE_FRONT_BLOCK       = 0.150    # stop forward when wall this close (m)
-MAZE_RIGHT_OPENING     = 0.45    # right reading > this = corridor opening
+MAZE_FRONT_BLOCK       = 0.15     # stop forward when wall this close (m)
+MAZE_RIGHT_OPENING     = 0.50    # right reading > this = corridor opening
 MAZE_LEFT_OPENING      = 0.45
 MAZE_PEEK_INTERVAL     = 4.0     # seconds of driving between right peeks
 MAZE_PEEK_TURN_DUR     = 1.50    # time to rotate head ~90° (TUNE in test_turns.py)
@@ -93,7 +93,8 @@ async def read_front_radar(r) -> dict:
             return orjson.loads(raw)
         except Exception:
             pass
-    return {"detected": False, "dist": None, "intra": 0.0, "inter": 0.0}
+    return {"detected": False, "dist": None, "proximity": False,
+            "intra": 0.0, "inter": 0.0}
 
 
 async def read_rear_radar(r) -> dict:
@@ -374,6 +375,22 @@ class MazeMode:
             return
 
         front = await read_front_radar(self.r)
+
+        # ── PROXIMITY EMERGENCY STOP ──────────────────────────────────
+        # Inspired by the Acconeer Touchless Button reference: any strong
+        # reflection within MAZE_PROXIMITY_ZONE_M triggers an immediate
+        # abort of forward motion. Only applies to states where legs are
+        # driving forward; peek/turn/recenter states are unaffected.
+        forward_states = {
+            self.S_DRIVE, self.S_COMMIT_R, self.S_COMMIT_L, self.S_SPIN_180_DRIVE,
+        }
+        if self.state in forward_states and front.get("proximity", False):
+            self.mlog.warning("⚠ PROXIMITY ALERT — emergency stop, checking left")
+            await publish_velocity(self.r, 0.0, 0.0)
+            await asyncio.sleep(0.05)
+            await publish_velocity(self.r, 0.0, -MAZE_TURN_SPEED)
+            await self._enter(self.S_PEEK_L_TURN)
+            return
 
         # ---- ARMED ----------------------------------------------------
         # Wait for two calibrations to complete before accepting start:

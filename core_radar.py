@@ -53,26 +53,44 @@ except TypeError:
     )
 
 # Minimum abs_sweep signal to count as a real wall reflection.
-# Noise floor ~5-40, real wall ~80-140. 60 gives a safe margin.
+# Lower = more sensitive (picks up grazing/edge reflections, prevents
+# false "opening" at wall corners). Too low = detects noise.
+# Noise floor ~5-40, real wall ~80-140. 45 catches edge reflections.
 MAZE_SIGNAL_THRESHOLD = 45.0
 
+# Proximity zone — inspired by the Acconeer Touchless Button reference app.
+# Any reflection closer than MAZE_PROXIMITY_ZONE_M with signal above
+# MAZE_PROXIMITY_THRESHOLD triggers an emergency "about to collide" flag.
+# Uses lower threshold because close-range signals are stronger (1/r⁴), so
+# even grazing reflections should clear this bar when very close.
+MAZE_PROXIMITY_ZONE_M    = 0.150
+MAZE_PROXIMITY_THRESHOLD = 40.0
 
-def _closest_wall(dist_result) -> float | None:
+
+def _analyze_sweep(dist_result) -> tuple[float | None, bool]:
     """
-    Read raw abs_sweep and return distance (m) to the closest point
-    above MAZE_SIGNAL_THRESHOLD, or None if nothing detected.
-    Bypasses the built-in threshold which is too conservative for close walls.
+    Returns (closest_wall_m, proximity_alert).
+      closest_wall_m  — nearest reflection above MAZE_SIGNAL_THRESHOLD (or None)
+      proximity_alert — True if ANY bin inside MAZE_PROXIMITY_ZONE_M has
+                        signal > MAZE_PROXIMITY_THRESHOLD (emergency stop)
     """
     try:
         extra     = dist_result.processor_results[0].extra_result
         abs_sweep = extra.abs_sweep
         distances = extra.distances_m
-        above     = np.where(abs_sweep > MAZE_SIGNAL_THRESHOLD)[0]
-        if len(above) == 0:
-            return None
-        return float(distances[above[0]])
+
+        # Proximity check — look only at close bins, lower threshold
+        close_mask    = distances < MAZE_PROXIMITY_ZONE_M
+        close_signals = abs_sweep[close_mask]
+        proximity     = bool((close_signals > MAZE_PROXIMITY_THRESHOLD).any())
+
+        # Normal wall detection
+        above = np.where(abs_sweep > MAZE_SIGNAL_THRESHOLD)[0]
+        closest = float(distances[above[0]]) if len(above) > 0 else None
+
+        return closest, proximity
     except Exception:
-        return None
+        return None, False
 
 
 # ── Radar loop ────────────────────────────────────────────────────────────────
@@ -138,7 +156,11 @@ async def radar_loop(client, state_key: str, wlog):
                     # Clear calibration flag when leaving MAZE
                     await r.delete(KEY_DIST_CALIBRATED)
 
-                    detector = PresDetector(client=client, sensor_id=1, detector_config=PRES_CONFIG)
+                    detector = PresDetector(
+                        client=client,
+                        sensor_id=1,
+                        detector_config=PRES_CONFIG,
+                    )
                     detector.start()
                     maze_mode = want_maze
                     wlog.info("→ Presence Detector ({} mode)", mode)
@@ -147,23 +169,25 @@ async def radar_loop(client, state_key: str, wlog):
             result = await asyncio.to_thread(detector.get_next)
 
             if want_maze:
-                closest = _closest_wall(result[1])
+                closest, proximity = _analyze_sweep(result[1])
                 await r.set(state_key, orjson.dumps({
-                    "detected": closest is not None,
-                    "dist":     round(closest, 3) if closest is not None else None,
-                    "intra":    0.0,
-                    "inter":    0.0,
-                    "ts":       round(time.time(), 4),
+                    "detected":  closest is not None,
+                    "dist":      round(closest, 3) if closest is not None else None,
+                    "proximity": proximity,
+                    "intra":     0.0,
+                    "inter":     0.0,
+                    "ts":        round(time.time(), 4),
                 }).decode())
             else:
                 pres    = result
                 detected = bool(pres.presence_detected)
                 await r.set(state_key, orjson.dumps({
-                    "detected": detected,
-                    "dist":     float(pres.presence_distance) if detected else None,
-                    "intra":    round(float(pres.intra_presence_score), 2),
-                    "inter":    round(float(pres.inter_presence_score), 2),
-                    "ts":       round(time.time(), 4),
+                    "detected":  detected,
+                    "dist":      float(pres.presence_distance) if detected else None,
+                    "proximity": False,  # not applicable for presence mode
+                    "intra":     round(float(pres.intra_presence_score), 2),
+                    "inter":     round(float(pres.inter_presence_score), 2),
+                    "ts":        round(time.time(), 4),
                 }).decode())
 
     except asyncio.CancelledError:
