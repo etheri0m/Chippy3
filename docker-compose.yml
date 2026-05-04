@@ -19,9 +19,15 @@ services:
       - SKIP_HARDWARE=${SKIP_HARDWARE:-0}
       # pigpiod runs on the HOST — tell pigpio client to connect there
       - PIGPIO_ADDR=host.docker.internal
+      - VALKEY_HOST=valkey
+      - FRONT_RADAR_PORT=/dev/ttyUSB0
+      - REAR_RADAR_PORT=/dev/ttyUSB2
     # USB serial devices for radars — pass through to container
     devices:
-      - /dev/serial/by-id:/dev/serial/by-id
+      - /dev/ttyUSB0:/dev/ttyUSB0
+      - /dev/ttyUSB1:/dev/ttyUSB1
+      - /dev/ttyUSB2:/dev/ttyUSB2
+      - /dev/ttyUSB3:/dev/ttyUSB3
     # Needed for serial port access
     privileged: false
     group_add:

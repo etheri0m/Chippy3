@@ -9,7 +9,7 @@ from log_config import get_logger
 
 log = get_logger("Controller")
 
-REAR_RADAR_PORT = "/dev/serial/by-id/usb-Silicon_Labs_Acconeer_XE125_R1DNL25061800352-if00-port0"
+REAR_RADAR_PORT = os.environ.get("REAR_RADAR_PORT", "/dev/serial/by-id/usb-Silicon_Labs_Acconeer_XE125_R1DNL25061800352-if00-port0")
 
 # --- FOLLOW mode ---
 NEAR_ZONE      = 0.20
@@ -29,37 +29,102 @@ CROWD_LOW_THRESHOLD       = 3.0
 CROWD_HEAD_SWEEP_SPEED    = 0.6
 CROWD_HEAD_SWEEP_DURATION = 2.0
 
-# --- MAZE mode (right-hand wall-following) ---
-# Algorithm:
-#   - Drive forward, head/body aligned (hall sensor triggered)
-#   - Front radar continuously monitors what's ahead
-#   - Every PEEK_INTERVAL seconds: stop legs, rotate head right ~90°,
-#     read radar (now pointing right), then either:
-#       a) Right is OPEN (>OPENING dist or no detection) → COMMIT (don't
-#          return head, just drive — body follows head into right corridor)
-#       b) Right is BLOCKED → return head left until hall triggers, resume drive
-#   - If front becomes BLOCKED while driving:
-#       a) Rotate head left ~90°, read radar
-#       b) Left is OPEN → COMMIT left
-#       c) Left is BLOCKED → SPIN_180 (rotate further left ~90° more, drive out)
+# --- MAZE mode (right-hand wall-following, reactive) ---
 #
-# Hall sensor (chippy:state:hall) triggers when head/body aligned (forward).
-# After a commit, we wait for hall to trigger again — meaning the body has
-# rotated to align with where the head is now pointing = ready to drive straight
-# in the new direction.
-MAZE_DRIVE_SPEED       = 0.7
+# Algorithm (true right-hand rule, no timed peeks):
+#   DRIVE forward until the front radar sees a wall close enough to count as
+#   a junction. Stop. Peek RIGHT. If right is open, take it. If right is
+#   blocked, rotate the head through center to the LEFT and peek there. If
+#   left is open, take it. If both blocked, spin 180°. After any commit, wait
+#   for body alignment (hall sensor) before resuming forward drive.
+#
+# This solves serpentine mazes correctly, and would also solve any branching
+# maze whose entrance and exit are on the boundary (the classical right-hand
+# rule guarantee).
+#
+# All decisions are reactive — there are no timer-based events that could
+# fire mid-corridor and confuse the state machine.
+
+MAZE_DRIVE_SPEED       = 0.8
 MAZE_TURN_SPEED        = 0.7
-MAZE_FRONT_BLOCK       = 0.15     # stop forward when wall this close (m)
-MAZE_RIGHT_OPENING     = 0.50    # right reading > this = corridor opening
-MAZE_LEFT_OPENING      = 0.45
-MAZE_PEEK_INTERVAL     = 4.0     # seconds of driving between right peeks
-MAZE_PEEK_TURN_DUR     = 1.50    # time to rotate head ~90° (TUNE in test_turns.py)
-MAZE_RADAR_SETTLE      = 0.15    # wait after head stops for fresh radar reading
-MAZE_PEEK_CONFIRM_DUR  = 0.30    # collect samples for this long — all must show open
-MAZE_PEEK_MIN_SAMPLES  = 4       # require at least this many samples (20Hz → ~6/0.3s)
-MAZE_HALL_TIMEOUT      = 3.0     # max wait for hall after a commit
-MAZE_RECENTER_TIMEOUT  = 1.5     # max wait for hall during peek-return
-MAZE_REAR_SAFE_DIST    = 0.20    # for any future reverse safety check
+
+# Junction detection.  Front radar < this for MAZE_BLOCKED_CONFIRM consecutive
+# frames -> we're at a wall; run the peek protocol.
+MAZE_FRONT_BLOCK       = 0.20
+
+# Peek classification (hysteresis band).  Median of valid samples:
+#   > MAZE_OPEN_HI -> OPEN     (commit to that side)
+#   < MAZE_OPEN_LO -> BLOCKED  (try the other side)
+#   in between     -> UNCERTAIN (re-peek once with longer dwell)
+# Side wall in a 40cm corridor reads ~0.15-0.20m; opening reads >=0.40m or
+# undetected (corridor extends past sensor range).  Big margin either way.
+MAZE_OPEN_HI           = 0.35
+MAZE_OPEN_LO           = 0.25
+
+# Head rotation timing.  90° from hall-aligned takes exactly MAZE_PEEK_TURN_DUR
+# seconds at MAZE_TURN_SPEED — every state that depends on a timed turn
+# re-anchors on the hall sensor first.
+MAZE_PEEK_TURN_DUR     = 1.00
+
+# Sample collection.  Settle longer than before (was 0.15) so the radar's
+# first frame after head-stop isn't included.  Collect for 0.5s -> ~10 samples
+# at 20Hz, plenty for a stable median.
+MAZE_RADAR_SETTLE      = 0.30
+MAZE_PEEK_CONFIRM_DUR  = 0.50
+MAZE_PEEK_MIN_SAMPLES  = 6
+
+# A peek that comes back UNCERTAIN gets one retry with longer dwell.
+# Two uncertains in a row are treated as BLOCKED (conservative).
+MAZE_REPEEK_DWELL_MULT = 2.0
+
+# Commit alignment timeouts.  After a commit, body is rotating to align
+# with head.  First exit condition wins:
+#   1. Hall fires  (body aligned with head)
+#   2. After MAZE_COMMIT_MIN_DRIVE secs, front sees clear corridor
+#   3. MAZE_HALL_TIMEOUT — last-resort fallthrough
+MAZE_COMMIT_MIN_DRIVE  = 1.0
+MAZE_COMMIT_CLEAR_DIST = 0.30
+
+# COMMIT duration: how long the legs drive forward with head at side-90°
+# during a turn.  This is the only knob you adjust to tune body rotation,
+# same way you tuned MAZE_PEEK_TURN_DUR for the 90° head peek.
+#
+# Tuning rule: if the body undershoots the turn (robot keeps hitting the
+# same wall after turning) → INCREASE.  If the body overshoots (robot
+# ends up turned past 90°, drives sideways into next wall) → DECREASE.
+# Each 0.1s ≈ 6-9° of body rotation in your setup.
+MAZE_COMMIT_DURATION   = 1.0
+
+# Backwards-compat alias (not actually a hall-based timeout — it's a
+# fixed timer because hall can't fire from body rotation alone).
+MAZE_HALL_TIMEOUT      = MAZE_COMMIT_DURATION
+
+# Recentering during the right-blocked -> left-peek transition.
+# Head rotates left through the magnet; the hall pulse re-anchors timing.
+# 2x for the safety case where the magnet is missed entirely.
+MAZE_RECENTER_TIMEOUT  = 2.0
+
+# Multi-frame confirmation.  PROFILE_3 produces occasional single-frame
+# spurious returns; require N consecutive frames before reacting.
+MAZE_PROXIMITY_CONFIRM = 3
+MAZE_BLOCKED_CONFIRM   = 3
+
+# Pure time-based finish: after this many seconds since start, the
+# robot stops and declares finished.  No junction count, no radar
+# check — just the clock.  Tune to be slightly longer than your maze
+# actually takes.  Run faster than expected? Lower it.  Slower? Raise it.
+MAZE_RUN_DURATION = 85.0
+
+# Serpentine trust mode.  When True, if the right peek verdict is BLOCKED,
+# skip the left peek entirely and commit left.  This is correct for any
+# maze where a "front + right blocked" geometry guarantees left is the
+# only path forward (i.e., serpentines, single-path mazes).  Set False to
+# restore the full peek-left-before-committing behaviour, which is needed
+# for branching mazes with possible dead-ends.
+MAZE_TRUST_SERPENTINE = True
+
+# Reserved for future use (rear-radar safety during reverse maneuvers).
+MAZE_REAR_SAFE_DIST    = 0.20
 
 # --- Valkey keys ---
 KEY_MODE             = 'chippy:mode'
@@ -288,21 +353,42 @@ class CrowdMode:
 
 
 # ---------------------------------------------------------------------------
-# MAZE mode — right-hand wall following
+# MAZE mode — right-hand wall following (reactive)
 # ---------------------------------------------------------------------------
 
 class MazeMode:
+    """
+    Reactive right-hand wall-following.
+
+    Decision tree at every junction (front blocked):
+      1. Peek RIGHT
+      2. Right open    -> COMMIT_R
+      3. Right blocked -> Peek LEFT
+      4. Left open     -> COMMIT_L
+      5. Left blocked  -> SPIN_180
+
+    Hysteresis on peek classification:
+      median > MAZE_OPEN_HI   -> OPEN
+      median < MAZE_OPEN_LO   -> BLOCKED
+      anywhere in between     -> UNCERTAIN (re-peek once with longer dwell)
+
+    Body alignment after a turn is confirmed (in priority order) by:
+      hall sensor fires  OR
+      front-clear past MAZE_COMMIT_CLEAR_DIST after MAZE_COMMIT_MIN_DRIVE  OR
+      MAZE_HALL_TIMEOUT (last resort)
+    """
+
     S_ARMED          = "ARMED"
     S_DRIVE          = "DRIVE"
-    S_PEEK_R_TURN    = "PEEK_R_TURN"
-    S_PEEK_R_READ    = "PEEK_R_READ"
-    S_PEEK_R_RETURN  = "PEEK_R_RETURN"
-    S_COMMIT_R       = "COMMIT_R"
-    S_PEEK_L_TURN    = "PEEK_L_TURN"
-    S_PEEK_L_READ    = "PEEK_L_READ"
-    S_COMMIT_L       = "COMMIT_L"
-    S_SPIN_180_TURN  = "SPIN_180_TURN"
-    S_SPIN_180_DRIVE = "SPIN_180_DRIVE"
+    S_PEEK_R_TURN    = "PEEK_R_TURN"     # rotating head right (timed)
+    S_PEEK_R_READ    = "PEEK_R_READ"     # head right, sampling
+    S_TO_LEFT        = "TO_LEFT"         # right blocked: rotating left through hall to left-90°
+    S_PEEK_L_READ    = "PEEK_L_READ"     # head left, sampling
+    S_COMMIT_R       = "COMMIT_R"        # head right, legs forward, body following
+    S_COMMIT_L       = "COMMIT_L"        # head left,  legs forward, body following
+    S_SPIN_180_TURN  = "SPIN_180_TURN"   # both sides blocked: another 90° left to reach 180°
+    S_SPIN_180_DRIVE = "SPIN_180_DRIVE"  # head behind, legs forward, body 180°-ing
+    S_FINISHED       = "FINISHED"
 
     def __init__(self, r):
         self.r              = r
@@ -310,19 +396,38 @@ class MazeMode:
         self.state_start    = 0.0
         self.active         = False
         self.mlog           = get_logger("Maze")
-        self.last_peek_time = 0.0
-        self.peek_dist      = None
-        self.left_dist      = None
-        self._peek_samples: list = []  # collected radar readings during peek-read
 
+        # Last published peek distances (for dashboard)
+        self.peek_dist      = None    # right peek
+        self.left_dist      = None    # left peek
+
+        # Sampling
+        self._peek_samples: list = []
+        self._uncertain_repeek: bool = False  # set true on first UNCERTAIN
+
+        # Run-wide timers/counters
+        self.run_start_time:    float | None = None
+        self._front_open_count: int = 0
+        self._proximity_count:  int = 0
+        self._blocked_count:    int = 0
+        self._junctions_done:   int = 0   # incremented on each COMMIT/SPIN → DRIVE
+
+        # TO_LEFT uses a pure timer now (MAZE_PEEK_TURN_DUR * 2), no hall substate needed.
+
+    # ------------------------------------------------------------------
     async def reset(self):
         await publish_velocity(self.r, 0.0, 0.0)
         self.state          = None
         self.active         = False
-        self.last_peek_time = 0.0
         self.peek_dist      = None
         self.left_dist      = None
         self._peek_samples  = []
+        self._uncertain_repeek = False
+        self.run_start_time    = None
+        self._front_open_count = 0
+        self._proximity_count  = 0
+        self._blocked_count    = 0
+        self._junctions_done   = 0
         try:
             await self.r.delete(KEY_MAZE_START)
         except Exception:
@@ -346,6 +451,13 @@ class MazeMode:
 
     # ------------------------------------------------------------------
     async def _enter(self, new_state: str):
+        if new_state == self.S_DRIVE:
+            self._front_open_count = 0
+            self._proximity_count  = 0
+            self._blocked_count    = 0
+        if new_state in (self.S_PEEK_R_READ, self.S_PEEK_L_READ):
+            # Reset sampling at the start of a fresh read window
+            self._peek_samples = []
         self.state       = new_state
         self.state_start = time.time()
         self.mlog.info("→ {}", new_state)
@@ -367,6 +479,41 @@ class MazeMode:
         return v == "1"
 
     # ------------------------------------------------------------------
+    def _classify_peek(self, samples: list) -> tuple[str, float | None]:
+        """
+        Classify a peek as 'open' / 'blocked' / 'uncertain' from the
+        collected samples.  Returns (verdict, median_or_None).
+
+        Decision rules:
+          - If >=60% of samples are None (no detection), the side is OPEN.
+            (1D radar reports None when no return clears the signal threshold,
+            which means the corridor extends past sensor range.)
+          - Otherwise compute median of valid distances.
+          - median >= MAZE_OPEN_HI -> OPEN
+          - median <= MAZE_OPEN_LO -> BLOCKED
+          - in-between             -> UNCERTAIN
+        """
+        if not samples:
+            return "uncertain", None
+
+        none_count = sum(1 for s in samples if s is None)
+        if none_count >= len(samples) * 0.6:
+            return "open", None
+
+        valid = [s for s in samples if s is not None]
+        if not valid:
+            return "open", None
+
+        valid_sorted = sorted(valid)
+        median = valid_sorted[len(valid_sorted) // 2]
+
+        if median >= MAZE_OPEN_HI:
+            return "open", median
+        if median <= MAZE_OPEN_LO:
+            return "blocked", median
+        return "uncertain", median
+
+    # ------------------------------------------------------------------
     # Main tick
     # ------------------------------------------------------------------
     async def update(self):
@@ -376,28 +523,37 @@ class MazeMode:
 
         front = await read_front_radar(self.r)
 
-        # ── PROXIMITY EMERGENCY STOP ──────────────────────────────────
-        # Inspired by the Acconeer Touchless Button reference: any strong
-        # reflection within MAZE_PROXIMITY_ZONE_M triggers an immediate
-        # abort of forward motion. Only applies to states where legs are
-        # driving forward; peek/turn/recenter states are unaffected.
-        forward_states = {
-            self.S_DRIVE, self.S_COMMIT_R, self.S_COMMIT_L, self.S_SPIN_180_DRIVE,
-        }
-        if self.state in forward_states and front.get("proximity", False):
-            self.mlog.warning("⚠ PROXIMITY ALERT — emergency stop, checking left")
-            await publish_velocity(self.r, 0.0, 0.0)
-            await asyncio.sleep(0.05)
-            await publish_velocity(self.r, 0.0, -MAZE_TURN_SPEED)
-            await self._enter(self.S_PEEK_L_TURN)
-            return
+        # ── PROXIMITY EMERGENCY ─────────────────────────────────────────
+        # Only meaningful when the legs are driving forward.  In DRIVE we
+        # treat it as a junction trigger (run the peek protocol).  In a
+        # COMMIT we let the existing alignment logic finish — pulling out
+        # of a commit mid-rotation creates worse problems than it solves.
+        if self.state == self.S_DRIVE:
+            if front.get("proximity", False):
+                self._proximity_count += 1
+            else:
+                self._proximity_count = 0
+
+            if self._proximity_count >= MAZE_PROXIMITY_CONFIRM:
+                self._proximity_count = 0
+                self._blocked_count   = 0
+                self.mlog.warning(
+                    "⚠ PROXIMITY ({} frames) — entering junction protocol",
+                    MAZE_PROXIMITY_CONFIRM
+                )
+                await publish_velocity(self.r, 0.0, 0.0)
+                await asyncio.sleep(0.05)
+                await publish_velocity(self.r, 0.0, MAZE_TURN_SPEED)
+                self._uncertain_repeek = False
+                await self._enter(self.S_PEEK_R_TURN)
+                return
 
         # ---- ARMED ----------------------------------------------------
         # Wait for two calibrations to complete before accepting start:
         #   1. Radar distance detector calibrated (core_radar.py sets KEY_DIST_CALIBRATED)
         #   2. Head calibrated (core_hardware.py's smart_calibrate_head sets
         #      KEY_HEAD_STATE with calibrated=True, head ends up centered)
-        # Both run in parallel — so the wait is just "whichever finishes last".
+        # Both run in parallel — wait is just "whichever finishes last".
         if self.state == self.S_ARMED:
             radar_ok = bool(await self.r.get(KEY_DIST_CALIBRATED))
 
@@ -423,18 +579,20 @@ class MazeMode:
             if flag:
                 await self.r.delete(KEY_MAZE_START)
                 self.mlog.info("Start received — driving forward")
-                self.last_peek_time = time.time()
+                self.run_start_time = time.time()
+                self._front_open_count = 0
                 await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
                 await self._enter(self.S_DRIVE)
             elif int(self._elapsed()) % 2 == 0 and self._elapsed() % 1.0 < 0.1:
                 self.mlog.info(
-                    "All calibrated — place robot then: redis-cli set {} 1", KEY_MAZE_START
+                    "All calibrated — place robot then: redis-cli set {} 1",
+                    KEY_MAZE_START
                 )
             return
 
         # ---- DRIVE ----------------------------------------------------
-        # Head and body aligned (hall triggered), legs forward.
-        # Two reactive triggers: front blocked → check left; peek timer → check right
+        # Forward, head/body aligned (hall=1).  Watch front for blockage
+        # (junction) or sustained open space (finish line).
         if self.state == self.S_DRIVE:
             blocked = (
                 front["detected"] and
@@ -442,171 +600,204 @@ class MazeMode:
                 front["dist"] < MAZE_FRONT_BLOCK
             )
             if blocked:
-                self.mlog.warning("Front blocked at {:.2f}m — checking left", front["dist"])
+                self._blocked_count += 1
+            else:
+                self._blocked_count = 0
+
+            if self._blocked_count >= MAZE_BLOCKED_CONFIRM:
+                self._blocked_count    = 0
+                self._front_open_count = 0
+                d_str = f"{front['dist']:.2f}m" if front.get('dist') is not None else "?"
+                self.mlog.warning(
+                    "Junction — front blocked at {} ({} frames). Peeking RIGHT first.",
+                    d_str, MAZE_BLOCKED_CONFIRM
+                )
                 await publish_velocity(self.r, 0.0, 0.0)
-                # Begin left rotation
-                await publish_velocity(self.r, 0.0, -MAZE_TURN_SPEED)
-                await self._enter(self.S_PEEK_L_TURN)
+                await asyncio.sleep(0.05)
+                await publish_velocity(self.r, 0.0, MAZE_TURN_SPEED)
+                self._uncertain_repeek = False
+                await self._enter(self.S_PEEK_R_TURN)
                 return
 
-            if time.time() - self.last_peek_time >= MAZE_PEEK_INTERVAL:
-                f_str = f"{front['dist']:.2f}m" if front.get('dist') is not None else "open"
-                self.mlog.info("Peek-right time (front: {})", f_str)
+            # Finish detection — pure time-based.  After MAZE_RUN_DURATION
+            # seconds since start, declare finished.  No junction count,
+            # no radar checks, just the clock.
+            if (self.run_start_time is not None and
+                    time.time() - self.run_start_time >= MAZE_RUN_DURATION):
+                elapsed = int(time.time() - self.run_start_time)
+                self.mlog.success(
+                    "🏁 FINISH — {}s elapsed (MAZE_RUN_DURATION = {}s)",
+                    elapsed, MAZE_RUN_DURATION
+                )
                 await publish_velocity(self.r, 0.0, 0.0)
-                # Begin right rotation
-                await publish_velocity(self.r, 0.0, MAZE_TURN_SPEED)
-                await self._enter(self.S_PEEK_R_TURN)
+                await self._enter(self.S_FINISHED)
                 return
             return
 
-        # ---- PEEK_R_TURN ----------------------------------------------
-        # Rotating head ~90° right (timed). Hall will go off shortly after start.
+        # ---- PEEK_R_TURN ---------------------------------------------
+        # Rotating head right at MAZE_TURN_SPEED.  Started from hall-aligned
+        # so MAZE_PEEK_TURN_DUR is reliably 90°.
         if self.state == self.S_PEEK_R_TURN:
             if self._elapsed() >= MAZE_PEEK_TURN_DUR:
                 await publish_velocity(self.r, 0.0, 0.0)
                 await self._enter(self.S_PEEK_R_READ)
             return
 
-        # ---- PEEK_R_READ ----------------------------------------------
-        # Head pointing right (legs stopped). Collect samples over
-        # MAZE_PEEK_CONFIRM_DUR — ALL samples must show open to commit.
-        # This rejects one-off false "open" readings at wall edges.
+        # ---- PEEK_R_READ ---------------------------------------------
+        # Head stopped, pointing right.  Settle, then collect samples.
         if self.state == self.S_PEEK_R_READ:
             if self._elapsed() < MAZE_RADAR_SETTLE:
+                # Pre-settle: discard whatever's in the buffer
                 self._peek_samples = []
                 return
 
-            # Accumulate the current reading
-            d = front.get("dist")
-            self._peek_samples.append(d)
+            self._peek_samples.append(front.get("dist"))
 
-            # Still collecting
-            if self._elapsed() < MAZE_RADAR_SETTLE + MAZE_PEEK_CONFIRM_DUR:
+            confirm_dur = MAZE_PEEK_CONFIRM_DUR
+            if self._uncertain_repeek:
+                confirm_dur *= MAZE_REPEEK_DWELL_MULT
+
+            if self._elapsed() < MAZE_RADAR_SETTLE + confirm_dur:
                 return
 
-            # Need a minimum number of samples to make a decision
             if len(self._peek_samples) < MAZE_PEEK_MIN_SAMPLES:
-                self.mlog.warning(
-                    "Only {} samples collected, waiting...", len(self._peek_samples)
-                )
+                # Not enough data yet, keep collecting
                 return
 
-            # Analyse the samples — all must be open for a commit
-            all_open   = all(s is None or s > MAZE_RIGHT_OPENING
-                             for s in self._peek_samples)
-            valid      = [s for s in self._peek_samples if s is not None]
-            closest    = min(valid) if valid else None
-            n_detected = len(valid)
-
-            self.peek_dist = round(closest, 3) if closest is not None else None
-            c_str = f"{closest:.2f}m" if closest is not None else "all-OPEN"
+            verdict, median = self._classify_peek(self._peek_samples)
+            self.peek_dist = round(median, 3) if median is not None else None
+            m_str = f"{median:.2f}m" if median is not None else "open"
             self.mlog.info(
-                "Right peek: {} samples, {} detected, closest={}, all_open={}",
-                len(self._peek_samples), n_detected, c_str, all_open
+                "Right peek: n={} verdict={} median={} (repeek={})",
+                len(self._peek_samples), verdict, m_str, self._uncertain_repeek
             )
 
-            if all_open:
-                self.mlog.success("Right opening confirmed → committing right")
+            if verdict == "open":
+                self.mlog.success("Right OPEN → COMMIT_R")
+                self._uncertain_repeek = False
                 await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
                 await self._enter(self.S_COMMIT_R)
-            else:
-                self.mlog.info("Right blocked (or flickering) — returning to center")
+
+            elif verdict == "blocked":
+                self.mlog.info("Right BLOCKED → peeking LEFT")
+                self._uncertain_repeek = False
+                # Start head rotating LEFT.  TO_LEFT will re-anchor at
+                # the hall pulse and time another 90° from there.
                 await publish_velocity(self.r, 0.0, -MAZE_TURN_SPEED)
-                await self._enter(self.S_PEEK_R_RETURN)
+                await self._enter(self.S_TO_LEFT)
+
+            else:  # uncertain
+                if self._uncertain_repeek:
+                    self.mlog.warning(
+                        "Right UNCERTAIN twice — treating as BLOCKED, peeking LEFT"
+                    )
+                    self._uncertain_repeek = False
+                    await publish_velocity(self.r, 0.0, -MAZE_TURN_SPEED)
+                    await self._enter(self.S_TO_LEFT)
+                else:
+                    self.mlog.warning("Right UNCERTAIN — re-peeking with longer dwell")
+                    self._uncertain_repeek = True
+                    # Re-enter same state with fresh sample buffer + timer
+                    await self._enter(self.S_PEEK_R_READ)
             return
 
-        # ---- PEEK_R_RETURN --------------------------------------------
-        # Rotating head left until hall triggers (head centered = forward)
-        if self.state == self.S_PEEK_R_RETURN:
-            centered = await self._hall_centered()
-            if centered or self._elapsed() >= MAZE_RECENTER_TIMEOUT:
-                if not centered:
-                    self.mlog.warning("Recenter timeout — proceeding anyway")
-                await publish_velocity(self.r, 0.0, 0.0)
-                await asyncio.sleep(0.05)
-                await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
-                self.last_peek_time = time.time()
-                await self._enter(self.S_DRIVE)
+        # ---- TO_LEFT --------------------------------------------------
+        # Rotating head left from right-90° to left-90°.
+        # That is exactly 180° = MAZE_PEEK_TURN_DUR * 2.
+        # Pure timer — no hall sensor.  The hall detection during this
+        # rotation was unreliable: sometimes it fires early (false positive
+        # while head is still near right-90°, causing the +1s timed leg to
+        # land at the wrong angle), sometimes it never fires at all (4s
+        # timeout, then +1s = head has rotated 450° before COMMIT_L).
+        # Both produced excessive maniac turning.  A fixed 2× timer is
+        # consistent and requires no re-anchoring.
+        if self.state == self.S_TO_LEFT:
+            if self._elapsed() >= MAZE_PEEK_TURN_DUR * 2:
+                if MAZE_TRUST_SERPENTINE:
+                    self.mlog.success("Serpentine trust: right BLOCKED → COMMIT_L")
+                    await publish_velocity(self.r, 0.0, 0.0)
+                    await asyncio.sleep(0.1)
+                    await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
+                    await self._enter(self.S_COMMIT_L)
+                else:
+                    await publish_velocity(self.r, 0.0, 0.0)
+                    await self._enter(self.S_PEEK_L_READ)
             return
 
-        # ---- COMMIT_R -------------------------------------------------
-        # Head pointing right, legs forward. Body follows head.
-        # Wait for hall to trigger again — meaning body has rotated to align
-        # with where the head is pointing → ready to drive straight.
-        if self.state == self.S_COMMIT_R:
-            centered = await self._hall_centered()
-            if centered:
-                self.mlog.success("Body aligned with head — straight drive")
-                self.last_peek_time = time.time()
-                await self._enter(self.S_DRIVE)
-            elif self._elapsed() >= MAZE_HALL_TIMEOUT:
-                self.mlog.warning("Commit hall timeout — proceeding to DRIVE anyway")
-                self.last_peek_time = time.time()
-                await self._enter(self.S_DRIVE)
-            return
-
-        # ---- PEEK_L_TURN ----------------------------------------------
-        if self.state == self.S_PEEK_L_TURN:
-            if self._elapsed() >= MAZE_PEEK_TURN_DUR:
-                await publish_velocity(self.r, 0.0, 0.0)
-                await self._enter(self.S_PEEK_L_READ)
-            return
-
-        # ---- PEEK_L_READ ----------------------------------------------
-        # Same multi-sample confirmation pattern as PEEK_R_READ
+        # ---- PEEK_L_READ ---------------------------------------------
+        # Head stopped, pointing left.  Same protocol as PEEK_R_READ.
         if self.state == self.S_PEEK_L_READ:
             if self._elapsed() < MAZE_RADAR_SETTLE:
                 self._peek_samples = []
                 return
 
-            d = front.get("dist")
-            self._peek_samples.append(d)
+            self._peek_samples.append(front.get("dist"))
 
-            if self._elapsed() < MAZE_RADAR_SETTLE + MAZE_PEEK_CONFIRM_DUR:
+            confirm_dur = MAZE_PEEK_CONFIRM_DUR
+            if self._uncertain_repeek:
+                confirm_dur *= MAZE_REPEEK_DWELL_MULT
+
+            if self._elapsed() < MAZE_RADAR_SETTLE + confirm_dur:
                 return
 
             if len(self._peek_samples) < MAZE_PEEK_MIN_SAMPLES:
-                self.mlog.warning(
-                    "Only {} samples collected, waiting...", len(self._peek_samples)
-                )
                 return
 
-            all_open = all(s is None or s > MAZE_LEFT_OPENING
-                           for s in self._peek_samples)
-            valid    = [s for s in self._peek_samples if s is not None]
-            closest  = min(valid) if valid else None
-
-            self.left_dist = round(closest, 3) if closest is not None else None
-            c_str = f"{closest:.2f}m" if closest is not None else "all-OPEN"
+            verdict, median = self._classify_peek(self._peek_samples)
+            self.left_dist = round(median, 3) if median is not None else None
+            m_str = f"{median:.2f}m" if median is not None else "open"
             self.mlog.info(
-                "Left peek: {} samples, closest={}, all_open={}",
-                len(self._peek_samples), c_str, all_open
+                "Left peek: n={} verdict={} median={} (repeek={})",
+                len(self._peek_samples), verdict, m_str, self._uncertain_repeek
             )
 
-            if all_open:
-                self.mlog.success("Left opening confirmed → committing left")
+            if verdict == "open":
+                self.mlog.success("Left OPEN → COMMIT_L")
+                self._uncertain_repeek = False
                 await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
                 await self._enter(self.S_COMMIT_L)
-            else:
-                self.mlog.warning("Dead end (front + left blocked) — spinning 180")
+
+            elif verdict == "blocked":
+                self.mlog.warning("Both sides BLOCKED → SPIN 180°")
+                self._uncertain_repeek = False
+                # Head is at left-90°.  Continue rotating left another
+                # MAZE_PEEK_TURN_DUR to reach 180° from forward.
                 await publish_velocity(self.r, 0.0, -MAZE_TURN_SPEED)
                 await self._enter(self.S_SPIN_180_TURN)
+
+            else:  # uncertain
+                if self._uncertain_repeek:
+                    self.mlog.warning(
+                        "Left UNCERTAIN twice — treating as BLOCKED, SPIN 180°"
+                    )
+                    self._uncertain_repeek = False
+                    await publish_velocity(self.r, 0.0, -MAZE_TURN_SPEED)
+                    await self._enter(self.S_SPIN_180_TURN)
+                else:
+                    self.mlog.warning("Left UNCERTAIN — re-peeking with longer dwell")
+                    self._uncertain_repeek = True
+                    await self._enter(self.S_PEEK_L_READ)
             return
 
-        # ---- COMMIT_L -------------------------------------------------
-        if self.state == self.S_COMMIT_L:
-            centered = await self._hall_centered()
-            if centered:
-                self.mlog.success("Body aligned with head — straight drive")
-                self.last_peek_time = time.time()
-                await self._enter(self.S_DRIVE)
-            elif self._elapsed() >= MAZE_HALL_TIMEOUT:
-                self.mlog.warning("Commit hall timeout — proceeding to DRIVE anyway")
-                self.last_peek_time = time.time()
+        # ---- COMMIT_R / COMMIT_L -------------------------------------
+        # Head at side-90°, legs forward.  Body rotates due to leg drive
+        # against head leverage.  Exit after MAZE_COMMIT_DURATION elapses.
+        # Adjust MAZE_COMMIT_DURATION up/down to tune the body rotation
+        # amount.  No recenter, no hall check, no radar fallback — just
+        # a clean timer.
+        if self.state in (self.S_COMMIT_R, self.S_COMMIT_L):
+            await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
+
+            if self._elapsed() >= MAZE_COMMIT_DURATION:
+                self._junctions_done += 1
+                self.mlog.success(
+                    "Commit {:.1f}s complete — DRIVE [junction #{}]",
+                    MAZE_COMMIT_DURATION, self._junctions_done
+                )
                 await self._enter(self.S_DRIVE)
             return
 
-        # ---- SPIN_180_TURN --------------------------------------------
+        # ---- SPIN_180_TURN -------------------------------------------
         # Already rotated ~90° left (during PEEK_L), now another ~90° to hit 180°
         if self.state == self.S_SPIN_180_TURN:
             if self._elapsed() >= MAZE_PEEK_TURN_DUR:
@@ -614,20 +805,27 @@ class MazeMode:
                 await self._enter(self.S_SPIN_180_DRIVE)
             return
 
-        # ---- SPIN_180_DRIVE -------------------------------------------
-        # Head at 180° from original, legs driving. Body follows.
+        # ---- SPIN_180_DRIVE ------------------------------------------
+        # Unreachable while MAZE_TRUST_SERPENTINE = True (kept for the
+        # branching-maze fallback only).  Same simple timer as COMMIT
+        # but for a 180° body rotation.
         if self.state == self.S_SPIN_180_DRIVE:
-            centered = await self._hall_centered()
-            if centered:
-                self.mlog.success("Body realigned after 180 — straight drive")
-                self.last_peek_time = time.time()
-                await self._enter(self.S_DRIVE)
-            elif self._elapsed() >= MAZE_HALL_TIMEOUT:
-                self.mlog.warning("Spin-180 hall timeout — proceeding to DRIVE anyway")
-                self.last_peek_time = time.time()
+            await publish_velocity(self.r, MAZE_DRIVE_SPEED, 0.0)
+
+            if self._elapsed() >= MAZE_COMMIT_DURATION * 2:
+                self._junctions_done += 1
+                self.mlog.success(
+                    "Spin-180 {:.1f}s complete — DRIVE [junction #{}]",
+                    MAZE_COMMIT_DURATION * 2, self._junctions_done
+                )
                 await self._enter(self.S_DRIVE)
             return
 
+        # ---- FINISHED ------------------------------------------------
+        # Maze complete — motors stopped, waiting for mode change.
+        if self.state == self.S_FINISHED:
+            await publish_velocity(self.r, 0.0, 0.0)
+            return
 
 # ---------------------------------------------------------------------------
 # IDLE mode

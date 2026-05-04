@@ -17,7 +17,7 @@ from log_config import get_logger
 
 log = get_logger("Radar")
 
-FRONT_RADAR_PORT = "/dev/serial/by-id/usb-Silicon_Labs_Acconeer_XE125_R1DNL25061800337-if00-port0"
+FRONT_RADAR_PORT = os.environ.get("FRONT_RADAR_PORT", "/dev/serial/by-id/usb-Silicon_Labs_Acconeer_XE125_R1DNL25061800337-if00-port0")
 KEY_FRONT            = "chippy:state:radar:front"
 KEY_MODE             = "chippy:mode"
 KEY_DIST_CALIBRATED  = "chippy:state:radar:dist_calibrated"  # set to "1" when ready
@@ -39,16 +39,17 @@ PRES_CONFIG = PresConfig(
 try:
     DIST_CONFIG = DistConfig(
         start_m=0.10,
-        end_m=0.50,
-        max_profile=a121.Profile.PROFILE_1,
+        end_m=1.50,
+        max_profile=a121.Profile.PROFILE_3,
         close_range_leakage_cancellation=True,
     )
+
 except TypeError:
     # Older SDK versions may not have this parameter — fall back gracefully
     log.warning("close_range_leakage_cancellation not supported in this SDK version")
     DIST_CONFIG = DistConfig(
         start_m=0.10,
-        end_m=0.50,
+        end_m=0.150,
         max_profile=a121.Profile.PROFILE_1,
     )
 
@@ -56,7 +57,7 @@ except TypeError:
 # Lower = more sensitive (picks up grazing/edge reflections, prevents
 # false "opening" at wall corners). Too low = detects noise.
 # Noise floor ~5-40, real wall ~80-140. 45 catches edge reflections.
-MAZE_SIGNAL_THRESHOLD = 45.0
+MAZE_SIGNAL_THRESHOLD = 30.0
 
 # Proximity zone — inspired by the Acconeer Touchless Button reference app.
 # Any reflection closer than MAZE_PROXIMITY_ZONE_M with signal above

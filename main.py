@@ -105,6 +105,7 @@ KEYS = {
     "radar_rear":  "chippy:state:radar:rear",
     "crowd":       "chippy:state:crowd",
     "maze":        "chippy:state:maze",
+    "radar_cal":   "chippy:state:radar:dist_calibrated",
 }
 
 KEY_MAZE_START = "chippy:cmd:maze:start"
@@ -463,6 +464,13 @@ def dashboard():
                 with ui.row().classes("w-full justify-between"):
                     ui.label("Obstacle").classes("data-label")
                     maze_obstacle = ui.label("—").classes("data-value")
+                with ui.row().classes("w-full items-center gap-2 mt-2"):
+                    maze_radar_dot = ui.label("●").style(
+                        "font-size:12px; color:#2a2a30;"
+                    )
+                    maze_radar_label = ui.label("Radars not calibrated").style(
+                        "font-size:11px; color:#6b6b76;"
+                    )
             maze_bar = ui.linear_progress(value=0, show_value=False).style(
                 "height:8px; margin-top:8px;"
             ).props("color='light-blue'")
@@ -506,6 +514,7 @@ def dashboard():
                 rj   = d["radar_rear"]
                 cr   = d["crowd"]
                 mz   = d["maze"]
+                radar_cal = "1"
             else:
                 mode = await vk.get(KEYS["mode"]) or "—"
                 head = await vk_get(KEYS["head"])
@@ -514,6 +523,7 @@ def dashboard():
                 rj   = await vk_get(KEYS["radar_rear"])
                 cr   = await vk_get(KEYS["crowd"])
                 mz   = await vk_get(KEYS["maze"])
+                radar_cal = await vk.get(KEYS["radar_cal"])
 
             mode_label.text = mode
             # In IDLE (from STOP button) no mode button should look active
@@ -589,6 +599,16 @@ def dashboard():
                 maze_step.text = f"{step} / {total}"
                 maze_obstacle.text = "BLOCKED" if mz.get("obstacle") else "clear"
                 maze_bar.value = (step / total) if total > 0 else 0
+
+            # Radar calibration indicator (maze card)
+            if radar_cal == "1":
+                maze_radar_dot.style("font-size:12px; color:#00d4aa;")
+                maze_radar_label.text = "Radars calibrated"
+                maze_radar_label.style("font-size:11px; color:#00d4aa; font-weight:600;")
+            else:
+                maze_radar_dot.style("font-size:12px; color:#2a2a30;")
+                maze_radar_label.text = "Radars not calibrated"
+                maze_radar_label.style("font-size:11px; color:#6b6b76;")
 
             # Enable START only when we're in MAZE mode and waiting for go
             maze_armed = (
